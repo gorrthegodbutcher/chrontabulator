@@ -1,0 +1,20 @@
+{
+	"name": "chrontabulator",
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
+	"runArgs": [
+		"--privileged",
+		"-v", "/dev:/dev",
+		"-v", "/dev/shm:/dev/shm",
+		"-v", "/dev/hugepages:/dev/hugepages"
+	],
+	"postCreateCommand": "bash .devcontainer/setup.sh",
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-vscode.cpptools"
+			]
+		}
+	}
+}

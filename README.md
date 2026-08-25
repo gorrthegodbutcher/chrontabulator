@@ -1,0 +1,124 @@
+# chrontabulator
+
+A single SPDK-native process that captures UDP packets off a DPDK-owned
+NIC and records them straight to a raw NVMe bdev, with enough per-record
+metadata to sort them back into correct order in a later, separate replay
+pass. Built on the same `spdk-dpdk-ubuntu` base image as its sibling
+projects, but unlike `dpdk-app-example` (plain DPDK) or `spdk-app-example`
+(SPDK bdev only), this project runs DPDK ethdev RX polling and
+`spdk_bdev_*` NVMe writes in the same SPDK reactor.
+
+**The actual goal:** capture ~20 minutes of received network traffic to
+NVMe, then play it back sorted into correct order rather than arrival
+order. That distinction matters because it isn't hypothetical - a
+switch-induced reordering test in `dpdk-app-example`'s own investigation
+showed real traffic can arrive with sequence jumps exceeding 10,000
+positions while losing almost nothing, so out-of-order arrival is the
+normal case to design for. `dpdk-app-example` is used as-is (unmodified)
+as the traffic generator for testing this project; sorted replay itself
+is a later phase, not built yet.
+
+## Prerequisites
+
+1. Build and tag the base image, from the sibling `spdk-dpdk-ubuntu` repo:
+   ```
+   cd ../spdk-dpdk-ubuntu
+   docker build -f Dockerfile-single -t spdk-dpdk-ubuntu:26.05-local .
+   ```
+2. A spare, unpartitioned NVMe drive (not the OS boot drive) bound to
+   `vfio-pci`, the same way `spdk-app-example`'s NVMe section and
+   `dpdk-app-example`'s "Running against real hardware" section describe
+   for a drive/NIC respectively - the mechanism is identical either way.
+   Find the drive's PCIe address first: `readlink -f /sys/block/<dev>/device`.
+3. The capture NIC bound to `vfio-pci` too, same mechanism.
+4. Install VS Code's "Dev Containers" extension (`ms-vscode-remote.remote-containers`).
+
+## Getting started
+
+Open this folder in VS Code, "Dev Containers: Reopen in Container". First
+launch builds two things (several minutes total, see `.devcontainer/setup.sh`):
+a standalone, full-driver DPDK build from the same patched
+`/workspace/spdk/dpdk` submodule tree the base image ships (**not** a
+second clone - see "Why a separate DPDK build" below), then SPDK itself
+via `./configure --with-dpdk=<that build> && make && make install`.
+Subsequent launches skip both since they're already configured.
+
+## Why a separate DPDK build, and why static linking
+
+SPDK's own bundled DPDK build (`dpdkbuild/Makefile`'s `DPDK_DRIVERS` list)
+only compiles the driver classes SPDK's storage code actually uses - bus,
+mempool, power, crypto/compress. **No NIC drivers at all.** Since this
+project needs a real NIC PMD (atlantic) alongside SPDK's bdev machinery
+in the same process, SPDK is built with `--with-dpdk=<dir>` against a
+second, unrestricted build of the exact same already-patched DPDK source,
+compiled with plain `meson`/`ninja` instead of SPDK's wrapper.
+
+That still isn't enough on its own. This DPDK build detects itself as
+statically linked - `rte_bus_pci`/`rte_eal` end up embedded directly in
+any binary built against it (SPDK needs `rte_bus_pci` for its own
+NVMe/vfio-pci access). Loading the atlantic driver as a runtime plugin via
+EAL's `-d` flag (the pattern `dpdk-app-example` uses) pulls in a *second*,
+dynamically-loaded copy of `rte_bus_pci` as `librte_net_atlantic.so`'s own
+shared-library dependency - two copies of the same global driver registry
+in one process panics immediately (`UIO_RESOURCE_LIST tailq is already
+registered`). The fix is to link `librte_net_atlantic.a` directly into
+this project's own binary instead (see `src/Makefile`'s `--whole-archive
+-l:librte_net_atlantic.a` block) - one copy of everything, resolved at
+link time, no `-d` needed at runtime at all.
+
+(`dpdk-app-example`'s README documents a related but different version of
+this same class of bug: SPDK's install copies its own set of DPDK shared
+libraries, and `LD_LIBRARY_PATH` resolution order can silently pick the
+wrong copy. That project avoids it by never linking against SPDK in the
+first place. This project can't take that shortcut since it needs SPDK's
+bdev machinery, so it resolves the underlying conflict at the source
+instead: one external DPDK build, everything link-time static.)
+
+## Usage
+
+**Capture:**
+```
+./chrontabulator -A <nic-pci-addr> -c <nvme_bdev.json> -b <bdev-name> -P <udp-port> [-C <count>] [-M <mtu>] [-F]
+```
+- `-c` - SPDK bdev config JSON (see `testdata/nvme_bdev.json` for the
+  `bdev_nvme_attach_controller` template - point `traddr` at the capture
+  drive's PCIe address)
+- `-b` - the bdev name that config produces (`bdev_nvme_attach_controller`
+  with `name: "nvme0"` yields `nvme0n1`)
+- `-P` - UDP destination port to capture; everything else is ignored
+- `-C` - stop after this many records (default 0 = unlimited, Ctrl+C to stop)
+- `-M` / `-F` - MTU / restrict to 10G link speed, same meaning as the
+  equivalent `dpdk-app-example` receiver flags
+
+Ctrl+C (or `-C` being reached) flushes any partially-full write buffer,
+writes the superblock, and exits cleanly.
+
+**Dump** (reads a previous capture back and prints it, to verify the
+on-disk format without trusting a long run blind):
+```
+./chrontabulator -A <nic-pci-addr> -c <nvme_bdev.json> -b <bdev-name> -D
+```
+No NIC/DPDK setup happens in this mode - `-P` isn't required, and `-A`
+only matters because SPDK still parses it from the combined arg list even
+though nothing uses it here.
+
+## On-disk format
+
+See `src/record.h` for the exact layout (`chrono_record_hdr` /
+`chrono_superblock`). Records are written back-to-back into fixed-size
+chunks sized to the bdev's write-unit granularity, zero-padded at flush
+time so a reader can always tell real records from unwritten space via
+`magic == 0`. Each record carries the sender's own sequence number *and*
+this recorder's own `rte_rdtsc()` capture timestamp - the sequence number
+alone resets across sender restarts and isn't ordering-authoritative on
+its own, so `capture_tsc` is the real signal a later sorted-replay pass
+should use.
+
+## Roadmap
+
+Working now: single-segment capture-to-NVMe, `-D` readback verification.
+Planned, not started: network/storage housekeeping, a real table-of-
+contents with a segment index (so specific time ranges can be retrieved
+without scanning the whole device), and a management web page for
+storage/playback/hardware status - mirroring `dpdk-app-example`'s
+existing status UI.

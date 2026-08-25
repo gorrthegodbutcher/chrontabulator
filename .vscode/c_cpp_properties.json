@@ -1,0 +1,10 @@
+{
+	"configurations": [
+		{
+			"name": "chrontabulator",
+			"compileCommands": "${workspaceFolder}/src/compile_commands.json",
+			"cStandard": "c11"
+		}
+	],
+	"version": 4
+}
