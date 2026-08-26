@@ -5,6 +5,10 @@
 
 #include <rte_ethdev.h>
 #include <rte_cycles.h>
+#include <rte_lcore.h>
+#include <rte_malloc.h>
+#include <rte_mempool.h>
+#include <rte_memory.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -240,6 +244,62 @@ render_status_json(struct app_context_t *ctx, char *out, size_t out_size)
 		bytes_written, writes_completed, write_errors);
 }
 
+/* EAL/DPDK-level diagnostics, separate from the app-level counters in
+ * render_status_json() above - for troubleshooting the class of "weird"
+ * bug this project has repeatedly hit this session (leaked hugepages,
+ * mbufs never freed, etc.) rather than app-level capture correctness.
+ * All of these are read-only introspection over already-allocated DPDK
+ * structures (mempool ring counters, malloc heap metadata) - safe to call
+ * from any thread, same tier as the NIC stats above. ctx->mbuf_pool and
+ * ctx->mbuf_socket_id are set once at daemon_bring_up_networking(),
+ * before this thread is created, and never change after - same
+ * "write-before-thread-creation" safety as ctx->vol's static fields (see
+ * chrono_ctx.h). ctx->mbuf_socket_id specifically must be captured on the
+ * reactor thread rather than read here via rte_socket_id() - DPDK only
+ * recognizes threads it registered as EAL threads, so calling
+ * rte_socket_id() from this pthread returns -1 (SOCKET_ID_ANY), which
+ * rte_malloc_get_socket_stats() then rejects. */
+static void
+render_eal_json(struct app_context_t *ctx, char *out, size_t out_size)
+{
+	struct rte_malloc_socket_stats heap_stats;
+	int heap_rc = rte_malloc_get_socket_stats(ctx->mbuf_socket_id, &heap_stats);
+	unsigned int mbuf_avail = ctx->mbuf_pool ? rte_mempool_avail_count(ctx->mbuf_pool) : 0;
+	unsigned int mbuf_in_use = ctx->mbuf_pool ? rte_mempool_in_use_count(ctx->mbuf_pool) : 0;
+	uint32_t mbuf_pool_size = ctx->mbuf_pool ? ctx->mbuf_pool->size : 0;
+
+	if (heap_rc != 0)
+		memset(&heap_stats, 0, sizeof(heap_stats));
+
+	snprintf(out, out_size,
+		"{\n"
+		"  \"lcore_count\": %u,\n"
+		"  \"socket_id\": %d,\n"
+		"  \"physmem_size_bytes\": %" PRIu64 ",\n"
+		"  \"mbuf_pool\": {\n"
+		"    \"have_pool\": %s,\n"
+		"    \"size\": %u,\n"
+		"    \"available\": %u,\n"
+		"    \"in_use\": %u\n"
+		"  },\n"
+		"  \"malloc_heap\": {\n"
+		"    \"have_stats\": %s,\n"
+		"    \"heap_totalsz_bytes\": %zu,\n"
+		"    \"heap_freesz_bytes\": %zu,\n"
+		"    \"heap_allocsz_bytes\": %zu,\n"
+		"    \"greatest_free_size\": %zu,\n"
+		"    \"alloc_count\": %u,\n"
+		"    \"free_count\": %u\n"
+		"  }\n"
+		"}\n",
+		rte_lcore_count(), ctx->mbuf_socket_id, rte_eal_get_physmem_size(),
+		ctx->mbuf_pool ? "true" : "false", mbuf_pool_size, mbuf_avail, mbuf_in_use,
+		heap_rc == 0 ? "true" : "false",
+		heap_stats.heap_totalsz_bytes, heap_stats.heap_freesz_bytes,
+		heap_stats.heap_allocsz_bytes, heap_stats.greatest_free_size,
+		heap_stats.alloc_count, heap_stats.free_count);
+}
+
 static void
 send_admin_result(int fd, int rc, struct chrono_admin_request *req)
 {
@@ -279,6 +339,10 @@ handle_connection(int fd, struct app_context_t *ctx)
 		char json[2048];
 		render_status_json(ctx, json, sizeof(json));
 		send_response(fd, "200 OK", "application/json", json);
+	} else if (strncmp(request_line, "GET /eal.json ", strlen("GET /eal.json ")) == 0) {
+		char json[1024];
+		render_eal_json(ctx, json, sizeof(json));
+		send_response(fd, "200 OK", "application/json", json);
 	} else if (strncmp(request_line, "GET / ", strlen("GET / ")) == 0) {
 		send_response(fd, "200 OK", "text/html", CHRONO_WEB_HTML);
 	} else if (strncmp(request_line, "GET /segments.json", strlen("GET /segments.json")) == 0) {
@@ -298,7 +362,8 @@ handle_connection(int fd, struct app_context_t *ctx)
 	} else if (strncmp(request_line, "POST /recording/start", strlen("POST /recording/start")) == 0) {
 		req->op = CHRONO_ADMIN_RECORDING_START;
 		req->req_port = query_get_uint(request_line, "port", &v) ? (uint16_t)v : 0;
-		req->req_count_limit = query_get_uint(request_line, "count_limit", &v) ? v : 0;
+		req->req_count_limit_given = query_get_uint(request_line, "count_limit", &v);
+		req->req_count_limit = req->req_count_limit_given ? v : 0;
 		rc = chrono_admin_call(ctx, req, ADMIN_TIMEOUT_SEC);
 		send_admin_result(fd, rc == 0 ? req->rc : rc, req);
 	} else if (strncmp(request_line, "POST /recording/stop", strlen("POST /recording/stop")) == 0) {

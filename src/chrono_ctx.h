@@ -66,6 +66,13 @@ struct app_context_t {
 
 	uint16_t port;
 	struct rte_mempool *mbuf_pool;
+	int mbuf_socket_id; /* rte_socket_id(), captured once on the reactor
+			      * thread (a real EAL thread) when mbuf_pool is
+			      * created - rte_socket_id() returns -1 if called
+			      * from the web pthread instead, since DPDK never
+			      * registered it as an EAL thread. Same
+			      * write-before-thread-creation safety as
+			      * mbuf_pool itself. */
 	struct spdk_poller *rx_poller;
 
 	/* Single writer (capture_poll, on the reactor thread) in both CLI

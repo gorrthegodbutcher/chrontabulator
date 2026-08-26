@@ -460,7 +460,10 @@ admin_do_recording_start(struct app_context_t *ctx, struct chrono_admin_request 
 	}
 	if (req->req_port != 0)
 		ctx->opts.udp_port = req->req_port;
-	if (req->req_count_limit != 0)
+	/* Explicit 0 (from the web UI's "Unlimited" mode) must override a
+	 * nonzero daemon-startup default to actually mean unlimited - only
+	 * an omitted param keeps that default as-is. */
+	if (req->req_count_limit_given)
 		ctx->opts.count_limit = req->req_count_limit;
 	if (ctx->opts.udp_port == 0) {
 		chrono_admin_fulfill(req, -EINVAL);

@@ -49,8 +49,13 @@ struct chrono_admin_request {
 
 	/* request parameters - flat rather than a union, for clarity over
 	 * the handful of bytes it costs */
-	uint16_t req_port;             /* RECORDING_START, 0 = use ctx default */
-	uint64_t req_count_limit;      /* RECORDING_START, 0 = use ctx default */
+	uint16_t req_port;              /* RECORDING_START, 0 = use ctx default */
+	uint64_t req_count_limit;       /* RECORDING_START - meaningful only if
+					  * req_count_limit_given; 0 explicitly
+					  * means unlimited, distinct from "not
+					  * given, keep the daemon's startup
+					  * default" */
+	bool req_count_limit_given;     /* RECORDING_START */
 	uint32_t req_segment_id;       /* SEGMENT_RECORDS, SEGMENT_DELETE */
 	uint64_t req_offset;           /* SEGMENT_RECORDS */
 	uint32_t req_limit;            /* SEGMENT_RECORDS, clamped server-side */

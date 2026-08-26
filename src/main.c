@@ -558,8 +558,9 @@ claim_header_write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb
 	RTE_ETH_FOREACH_DEV(ctx->port)
 		break;
 
+	ctx->mbuf_socket_id = rte_socket_id();
 	ctx->mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS, MBUF_CACHE_SIZE, 0,
-						  MBUF_DATA_SIZE, rte_socket_id());
+						  MBUF_DATA_SIZE, ctx->mbuf_socket_id);
 	if (ctx->mbuf_pool == NULL) {
 		SPDK_ERRLOG("Cannot create mbuf pool: %s\n", rte_strerror(rte_errno));
 		fail_started(ctx);
@@ -1366,8 +1367,9 @@ daemon_bring_up_networking(struct app_context_t *ctx)
 	RTE_ETH_FOREACH_DEV(ctx->port)
 		break;
 
+	ctx->mbuf_socket_id = rte_socket_id();
 	ctx->mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS, MBUF_CACHE_SIZE, 0,
-						  MBUF_DATA_SIZE, rte_socket_id());
+						  MBUF_DATA_SIZE, ctx->mbuf_socket_id);
 	if (ctx->mbuf_pool == NULL) {
 		SPDK_ERRLOG("Cannot create mbuf pool: %s\n", rte_strerror(rte_errno));
 		fail_started(ctx);
