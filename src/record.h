@@ -84,6 +84,18 @@ enum chrono_segment_state {
 					* crash is out of scope. */
 	CHRONO_SEGMENT_FINALIZED = 2, /* clean shutdown - every field below
 					* is authoritative. */
+	CHRONO_SEGMENT_DELETED   = 3, /* user-requested delete (web UI or a
+					* future CLI equivalent) - hidden from
+					* listings/dumps by default, but every
+					* other field is left exactly as it
+					* was at finalize (or at claim, if
+					* deleting an abandoned OPEN segment) -
+					* explicitly inspecting a deleted entry
+					* still shows accurate historical
+					* counts. Disk space is NOT reclaimed,
+					* consistent with next_data_block's
+					* documented behavior above - only
+					* --init --force reformats the device. */
 };
 
 /* Block 0 of a formatted device. Self-describing: every other region's

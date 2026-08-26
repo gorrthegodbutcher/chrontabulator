@@ -34,12 +34,14 @@
 #include "common.h"
 #include "port_init.h"
 #include "record.h"
+#include "chrono_ctx.h"
+#include "chrono_admin.h"
+#include "web_status.h"
 
 #define NUM_MBUFS        8191
 #define MBUF_CACHE_SIZE  250
 #define MBUF_DATA_SIZE   9216
 #define BURST_SIZE       32
-#define NUM_WRITE_BUFFERS 4
 #define VOLUME_HEADER_BLOCK 0
 #define WRITE_CHUNK_TARGET (64 * 1024) /* rounded up to the device's own
 					 * write granularity below - not a
@@ -57,93 +59,21 @@
 enum {
 	CHRONO_OPT_INIT = 0x1000,
 	CHRONO_OPT_FORCE,
+	CHRONO_OPT_SERVE,
+	CHRONO_OPT_WEB_PORT,
 };
 
 static const struct option chrono_long_opts[] = {
-	{"init",  no_argument, NULL, CHRONO_OPT_INIT},
-	{"force", no_argument, NULL, CHRONO_OPT_FORCE},
+	{"init",     no_argument,       NULL, CHRONO_OPT_INIT},
+	{"force",    no_argument,       NULL, CHRONO_OPT_FORCE},
+	{"serve",    no_argument,       NULL, CHRONO_OPT_SERVE},
+	{"web-port", required_argument, NULL, CHRONO_OPT_WEB_PORT},
 	{NULL, 0, NULL, 0},
 };
 
-struct app_opts_t {
-	char *bdev_name;
-	uint16_t udp_port;
-	uint16_t mtu;
-	bool force_10g;
-	uint64_t count_limit; /* 0 = unlimited */
-	bool dump_mode;
-	bool init_mode;
-	bool force;
-	bool dump_segment_given;
-	uint32_t dump_segment_id;
-};
-
-struct write_buf {
-	uint8_t *data;
-	uint32_t used;
-	bool in_flight;
-};
-
-struct app_context_t {
-	struct app_opts_t opts;
-
-	struct spdk_bdev *bdev;
-	struct spdk_bdev_desc *bdev_desc;
-	struct spdk_io_channel *bdev_io_channel;
-	uint32_t block_size;
-	uint32_t buf_size; /* one write chunk, a multiple of block_size */
-	uint32_t buf_size_blocks;
-
-	struct write_buf buffers[NUM_WRITE_BUFFERS];
-	int cur_buf;
-	uint64_t next_write_block;
-
-	struct spdk_bdev_io_wait_entry bdev_io_wait;
-	struct write_buf *retry_buf;
-
-	uint16_t port;
-	struct rte_mempool *mbuf_pool;
-	struct spdk_poller *rx_poller;
-
-	uint64_t record_count;
-	uint64_t dropped_count;
-	uint64_t first_capture_tsc;
-	uint64_t last_capture_tsc;
-
-	int pending_writes;
-	bool stopping;
-
-	/* Volume header + a per-mode I/O buffer shared across capture's
-	 * claim/finalize single-block TOC writes, list mode's TOC scan,
-	 * dump-one-segment's record reads, and init's TOC zero-fill writes -
-	 * only one of those things ever happens per process invocation, so
-	 * one buffer each is enough. vol_buf is block_size (holds one
-	 * chrono_volume_header, block-padded); io_buf is buf_size (matches
-	 * the capture path's own write granularity, and comfortably holds
-	 * one chrono_segment_entry too). */
-	struct chrono_volume_header vol;
-	uint8_t *vol_buf;
-	uint8_t *io_buf;
-
-	uint32_t segment_id;
-	uint64_t segment_start_block;
-	uint64_t segment_wall_start_sec;
-	uint32_t segment_wall_start_nsec;
-
-	/* --init mode only: current block being zero-filled in the TOC
-	 * region, [vol.toc_start_block, vol.data_start_block). */
-	uint64_t init_cur_block;
-
-	/* -D (dump/list) mode only. Reused for both "list all segments"
-	 * (counting/scanning TOC slots) and "-S <id>: dump one segment's
-	 * records" (counting/scanning that segment's data blocks) - the two
-	 * never run in the same process invocation. */
-	uint64_t dump_target_count;
-	uint64_t dump_records_seen;
-	uint64_t dump_cur_block;
-	uint64_t dump_first_capture_tsc;
-	uint64_t dump_tsc_hz;
-};
+/* struct app_opts_t / write_buf / app_context_t now live in chrono_ctx.h,
+ * shared with chrono_admin.c (the reactor-thread side of the web bridge)
+ * and web_status.c (the pthread side). */
 
 static struct app_context_t g_ctx;
 
@@ -159,6 +89,11 @@ app_usage(void)
 	printf(" -D -S <id>                dump one segment's records instead of listing\n");
 	printf(" --init                    format the bdev as a fresh, empty chrontabulator volume\n");
 	printf(" --force                   with --init, reformat a bdev that already has one\n");
+	printf(" --serve                   run as a persistent daemon - -P/-C become the default\n");
+	printf("                           for sessions started via the web UI, not a hard\n");
+	printf("                           requirement; brings up the NIC once and lets\n");
+	printf("                           recording be started/stopped repeatedly\n");
+	printf(" --web-port=<port>         daemon's embedded web UI port (default 8080, 0 = headless)\n");
 }
 
 static int
@@ -193,6 +128,12 @@ app_parse_arg(int ch, char *arg)
 	case CHRONO_OPT_FORCE:
 		g_ctx.opts.force = true;
 		break;
+	case CHRONO_OPT_SERVE:
+		g_ctx.opts.serve_mode = true;
+		break;
+	case CHRONO_OPT_WEB_PORT:
+		g_ctx.opts.web_port = (uint16_t)strtoul(arg, NULL, 10);
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -201,6 +142,9 @@ app_parse_arg(int ch, char *arg)
 
 static void
 begin_shutdown(struct app_context_t *ctx);
+
+static void
+daemon_finalize_segment(struct app_context_t *ctx);
 
 static bool
 volume_header_is_valid(const struct chrono_volume_header *hdr)
@@ -271,7 +215,9 @@ finalize_toc_write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb
 
 	SPDK_NOTICELOG("Recorded %" PRIu64 " packets (%" PRIu64 " dropped due to backpressure)"
 		       " in segment %u\n",
-		       ctx->record_count, ctx->dropped_count, ctx->segment_id);
+		       atomic_load_explicit(&ctx->record_count, memory_order_relaxed),
+		       atomic_load_explicit(&ctx->dropped_count, memory_order_relaxed),
+		       ctx->segment_id);
 
 	cleanup_and_stop(ctx, 0);
 }
@@ -304,10 +250,10 @@ finalize_header_write_complete(struct spdk_bdev_io *bdev_io, bool success, void 
 	seg->state = CHRONO_SEGMENT_FINALIZED;
 	seg->start_block = ctx->segment_start_block;
 	seg->block_count = ctx->next_write_block - ctx->segment_start_block;
-	seg->record_count = ctx->record_count;
-	seg->dropped_count = ctx->dropped_count;
-	seg->first_capture_tsc = ctx->first_capture_tsc;
-	seg->last_capture_tsc = ctx->last_capture_tsc;
+	seg->record_count = atomic_load_explicit(&ctx->record_count, memory_order_relaxed);
+	seg->dropped_count = atomic_load_explicit(&ctx->dropped_count, memory_order_relaxed);
+	seg->first_capture_tsc = atomic_load_explicit(&ctx->first_capture_tsc, memory_order_relaxed);
+	seg->last_capture_tsc = atomic_load_explicit(&ctx->last_capture_tsc, memory_order_relaxed);
 	seg->tsc_hz = rte_get_tsc_hz();
 	seg->wall_clock_start_sec = ctx->segment_wall_start_sec;
 	seg->wall_clock_start_nsec = ctx->segment_wall_start_nsec;
@@ -347,6 +293,23 @@ finalize_segment_and_stop(struct app_context_t *ctx)
 	}
 }
 
+/* Shared by both CLI and daemon capture - the actual buffer-flush
+ * mechanics have no mode-specific behavior except which finalize
+ * function to call once a stop is fully drained, so a single dispatch
+ * point here is simpler and safer than duplicating this hot-path
+ * plumbing just to keep the two calls apart (unlike claim/finalize's own
+ * control logic, which IS duplicated - see daemon_claim_segment_start()
+ * etc. - specifically to keep this already-verified data path itself
+ * untouched by that split). */
+static void
+finalize_current_stop(struct app_context_t *ctx)
+{
+	if (ctx->opts.serve_mode)
+		daemon_finalize_segment(ctx);
+	else
+		finalize_segment_and_stop(ctx);
+}
+
 static void
 write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
@@ -357,12 +320,18 @@ write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	wb->in_flight = false;
 	wb->used = 0;
 
-	if (!success)
+	if (!success) {
 		SPDK_ERRLOG("bdev write error\n");
+		atomic_fetch_add_explicit(&ctx->write_errors_total, 1, memory_order_relaxed);
+	} else {
+		atomic_fetch_add_explicit(&ctx->bytes_written_total, ctx->buf_size,
+					   memory_order_relaxed);
+		atomic_fetch_add_explicit(&ctx->writes_completed_total, 1, memory_order_relaxed);
+	}
 
 	ctx->pending_writes--;
 	if (ctx->stopping && ctx->pending_writes == 0)
-		finalize_segment_and_stop(ctx);
+		finalize_current_stop(ctx);
 }
 
 static void
@@ -383,11 +352,12 @@ retry_flush(void *arg)
 		spdk_bdev_queue_io_wait(ctx->bdev, ctx->bdev_io_channel, &ctx->bdev_io_wait);
 	} else if (rc != 0) {
 		SPDK_ERRLOG("%s flushing write buffer: %d\n", spdk_strerror(-rc), rc);
+		atomic_fetch_add_explicit(&ctx->write_errors_total, 1, memory_order_relaxed);
 		wb->in_flight = false;
 		wb->used = 0;
 		ctx->pending_writes--;
 		if (ctx->stopping && ctx->pending_writes == 0)
-			finalize_segment_and_stop(ctx);
+			finalize_current_stop(ctx);
 	}
 }
 
@@ -471,7 +441,7 @@ capture_poll(void *arg)
 				 * single record too large to ever fit one
 				 * write chunk - drop it rather than block
 				 * the RX loop. */
-				ctx->dropped_count++;
+				atomic_fetch_add_explicit(&ctx->dropped_count, 1, memory_order_relaxed);
 				rte_pktmbuf_free(bufs[i]);
 				continue;
 			}
@@ -486,15 +456,24 @@ capture_poll(void *arg)
 		memcpy(wb->data + wb->used + sizeof(*hdr), payload, payload_len);
 		wb->used += rec_size;
 
-		ctx->record_count++;
-		if (ctx->first_capture_tsc == 0)
-			ctx->first_capture_tsc = now_tsc;
-		ctx->last_capture_tsc = now_tsc;
+		/* capture_poll only ever runs on the reactor thread, never
+		 * concurrently with itself, so these are the sole writers -
+		 * plain load-then-store is enough (no CAS needed); atomics
+		 * here exist only so the web thread can safely read live
+		 * values for /status.json without a lock. */
+		uint64_t new_count = atomic_fetch_add_explicit(&ctx->record_count, 1,
+								memory_order_relaxed) + 1;
+		if (atomic_load_explicit(&ctx->first_capture_tsc, memory_order_relaxed) == 0)
+			atomic_store_explicit(&ctx->first_capture_tsc, now_tsc, memory_order_relaxed);
+		atomic_store_explicit(&ctx->last_capture_tsc, now_tsc, memory_order_relaxed);
 
 		rte_pktmbuf_free(bufs[i]);
 
-		if (ctx->opts.count_limit != 0 && ctx->record_count >= ctx->opts.count_limit) {
-			begin_shutdown(ctx);
+		if (ctx->opts.count_limit != 0 && new_count >= ctx->opts.count_limit) {
+			if (ctx->opts.serve_mode)
+				daemon_stop_recording(ctx);
+			else
+				begin_shutdown(ctx);
 			break;
 		}
 	}
@@ -764,17 +743,22 @@ dump_segment_entry_read_complete(struct spdk_bdev_io *bdev_io, bool success, voi
 		cleanup_and_stop(ctx, -1);
 		return;
 	}
-	if (seg->magic != CHRONO_SEGMENT_MAGIC || seg->state == CHRONO_SEGMENT_FREE) {
+	enum chrono_segment_view view = chrono_segment_classify(seg);
+
+	if (view == CHRONO_SEG_VIEW_NOT_FOUND) {
 		SPDK_ERRLOG("segment %u does not exist\n", ctx->opts.dump_segment_id);
 		cleanup_and_stop(ctx, -1);
 		return;
 	}
-	if (seg->state != CHRONO_SEGMENT_FINALIZED) {
+	if (view == CHRONO_SEG_VIEW_OPEN) {
 		printf("Segment %u: never finalized (in progress, or crashed before"
 		       " finishing) - nothing to dump.\n", seg->segment_id);
 		cleanup_and_stop(ctx, 0);
 		return;
 	}
+	if (view == CHRONO_SEG_VIEW_DELETED)
+		printf("Segment %u: DELETED (dumping its historical contents anyway)\n",
+		       seg->segment_id);
 
 	printf("Segment %u: record_count=%" PRIu64 " dropped_count=%" PRIu64
 	       " tsc_hz=%" PRIu64 "\n", seg->segment_id, seg->record_count,
@@ -816,27 +800,28 @@ list_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_ar
 		return;
 	}
 
-	if (seg->magic == CHRONO_SEGMENT_MAGIC && seg->state != CHRONO_SEGMENT_FREE) {
-		if (seg->state == CHRONO_SEGMENT_FINALIZED) {
-			char start_str[32] = "n/a";
-			time_t t = (time_t)seg->wall_clock_start_sec;
-			struct tm tm_buf;
+	enum chrono_segment_view view = chrono_segment_classify(seg);
 
-			if (gmtime_r(&t, &tm_buf) != NULL)
-				strftime(start_str, sizeof(start_str), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
+	if (view == CHRONO_SEG_VIEW_FINALIZED || view == CHRONO_SEG_VIEW_DELETED) {
+		char start_str[32] = "n/a";
+		time_t t = (time_t)seg->wall_clock_start_sec;
+		struct tm tm_buf;
 
-			double duration = seg->tsc_hz != 0 ?
-				(double)(seg->last_capture_tsc - seg->first_capture_tsc) /
-				seg->tsc_hz : 0.0;
-			printf("segment %u: FINALIZED  start=%s  duration=%.3fs"
-			       "  records=%" PRIu64 "  dropped=%" PRIu64
-			       "  blocks=[%" PRIu64 "+%" PRIu64 ")\n",
-			       seg->segment_id, start_str, duration, seg->record_count,
-			       seg->dropped_count, seg->start_block, seg->block_count);
-		} else {
-			printf("segment %u: OPEN (in progress, or crashed before"
-			       " finishing - never finalized)\n", seg->segment_id);
-		}
+		if (gmtime_r(&t, &tm_buf) != NULL)
+			strftime(start_str, sizeof(start_str), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
+
+		double duration = seg->tsc_hz != 0 ?
+			(double)(seg->last_capture_tsc - seg->first_capture_tsc) /
+			seg->tsc_hz : 0.0;
+		printf("segment %u: %s  start=%s  duration=%.3fs"
+		       "  records=%" PRIu64 "  dropped=%" PRIu64
+		       "  blocks=[%" PRIu64 "+%" PRIu64 ")\n",
+		       seg->segment_id, view == CHRONO_SEG_VIEW_DELETED ? "DELETED" : "FINALIZED",
+		       start_str, duration, seg->record_count,
+		       seg->dropped_count, seg->start_block, seg->block_count);
+	} else if (view == CHRONO_SEG_VIEW_OPEN) {
+		printf("segment %u: OPEN (in progress, or crashed before"
+		       " finishing - never finalized)\n", seg->segment_id);
 	}
 
 	ctx->dump_records_seen++;
@@ -1110,6 +1095,383 @@ init_start(struct app_context_t *ctx)
 	}
 }
 
+/* ---- --serve: persistent daemon ----
+ *
+ * Mirrors the shape of claim_segment_start()/claim_toc_write_complete()/
+ * claim_header_write_complete() and finalize_segment_and_stop()/
+ * finalize_header_write_complete()/finalize_toc_write_complete() above,
+ * but as separate functions rather than branching those - threading a
+ * serve_mode conditional through every success/error path of the
+ * already-verified (1,000,000-packet scale) CLI capture chain risks
+ * subtly changing its behavior. These duplicate the shape and end
+ * differently: recording=true/poller registered (claim) or
+ * recording=false/admin request answered (finalize), instead of falling
+ * through to process exit. */
+
+static void
+daemon_teardown_and_exit(struct app_context_t *ctx)
+{
+	cleanup_and_stop(ctx, 0);
+}
+
+static void
+daemon_finalize_toc_write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct app_context_t *ctx = cb_arg;
+
+	if (bdev_io != NULL)
+		spdk_bdev_free_io(bdev_io);
+	if (!success)
+		SPDK_ERRLOG("failed to finalize segment %u's TOC entry\n", ctx->segment_id);
+
+	SPDK_NOTICELOG("Recorded %" PRIu64 " packets (%" PRIu64 " dropped due to backpressure)"
+		       " in segment %u\n",
+		       atomic_load_explicit(&ctx->record_count, memory_order_relaxed),
+		       atomic_load_explicit(&ctx->dropped_count, memory_order_relaxed),
+		       ctx->segment_id);
+
+	atomic_store_explicit(&ctx->recording, false, memory_order_relaxed);
+	atomic_store_explicit(&ctx->current_segment_id, CHRONO_NO_SEGMENT, memory_order_relaxed);
+
+	/* A SIGINT mid-recording routes here via daemon_stop_recording() too
+	 * (see daemon_shutdown_cb()) - if that's why we're finalizing, there
+	 * is no web request waiting to be answered, so tear the whole daemon
+	 * down instead of trying to fulfill one. */
+	if (atomic_load_explicit(&ctx->shutting_down, memory_order_relaxed))
+		daemon_teardown_and_exit(ctx);
+	else
+		chrono_admin_fulfill(&ctx->admin_req, success ? 0 : -EIO);
+}
+
+static void
+daemon_finalize_header_write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct app_context_t *ctx = cb_arg;
+	struct chrono_segment_entry *seg;
+	struct timespec ts;
+	int rc;
+
+	if (bdev_io != NULL)
+		spdk_bdev_free_io(bdev_io);
+	if (!success)
+		SPDK_ERRLOG("failed to update volume header at finalize - segment %u's data"
+			    " may be at risk of being overwritten by a future capture\n",
+			    ctx->segment_id);
+	else
+		atomic_store_explicit(&ctx->mirror_next_data_block, ctx->vol.next_data_block,
+				       memory_order_relaxed);
+
+	memset(ctx->io_buf, 0, ctx->block_size);
+	seg = (struct chrono_segment_entry *)ctx->io_buf;
+	seg->magic = CHRONO_SEGMENT_MAGIC;
+	seg->segment_id = ctx->segment_id;
+	seg->state = CHRONO_SEGMENT_FINALIZED;
+	seg->start_block = ctx->segment_start_block;
+	seg->block_count = ctx->next_write_block - ctx->segment_start_block;
+	seg->record_count = atomic_load_explicit(&ctx->record_count, memory_order_relaxed);
+	seg->dropped_count = atomic_load_explicit(&ctx->dropped_count, memory_order_relaxed);
+	seg->first_capture_tsc = atomic_load_explicit(&ctx->first_capture_tsc, memory_order_relaxed);
+	seg->last_capture_tsc = atomic_load_explicit(&ctx->last_capture_tsc, memory_order_relaxed);
+	seg->tsc_hz = rte_get_tsc_hz();
+	seg->wall_clock_start_sec = ctx->segment_wall_start_sec;
+	seg->wall_clock_start_nsec = ctx->segment_wall_start_nsec;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	seg->wall_clock_end_sec = (uint64_t)ts.tv_sec;
+	seg->wall_clock_end_nsec = (uint32_t)ts.tv_nsec;
+
+	rc = spdk_bdev_write(ctx->bdev_desc, ctx->bdev_io_channel, ctx->io_buf,
+			      (ctx->vol.toc_start_block + ctx->segment_id) * ctx->block_size,
+			      ctx->block_size, daemon_finalize_toc_write_complete, ctx);
+	if (rc != 0) {
+		SPDK_ERRLOG("%s finalizing segment %u's TOC entry\n", spdk_strerror(-rc),
+			    ctx->segment_id);
+		daemon_finalize_toc_write_complete(NULL, false, ctx);
+	}
+}
+
+static void
+daemon_finalize_segment(struct app_context_t *ctx)
+{
+	int rc;
+
+	ctx->vol.next_data_block = ctx->next_write_block;
+	memset(ctx->vol_buf, 0, ctx->block_size);
+	*(struct chrono_volume_header *)ctx->vol_buf = ctx->vol;
+
+	rc = spdk_bdev_write(ctx->bdev_desc, ctx->bdev_io_channel, ctx->vol_buf,
+			      VOLUME_HEADER_BLOCK * ctx->block_size, ctx->block_size,
+			      daemon_finalize_header_write_complete, ctx);
+	if (rc != 0) {
+		SPDK_ERRLOG("%s finalizing volume header: %d\n", spdk_strerror(-rc), rc);
+		daemon_finalize_header_write_complete(NULL, false, ctx);
+	}
+}
+
+/* Called both by admin_do_recording_stop() (chrono_admin.c, a web
+ * request) and by daemon_shutdown_cb() (a SIGINT mid-recording) - the
+ * finalize chain above tells the two cases apart via ctx->shutting_down
+ * at its terminal step. */
+void
+daemon_stop_recording(struct app_context_t *ctx)
+{
+	if (ctx->stopping)
+		return;
+	ctx->stopping = true;
+
+	spdk_poller_unregister(&ctx->rx_poller);
+	flush_buffer(ctx, ctx->cur_buf);
+
+	if (ctx->pending_writes == 0)
+		daemon_finalize_segment(ctx);
+	/* else write_complete()/retry_flush() call daemon_finalize_segment()
+	 * once pending_writes reaches 0, via finalize_current_stop(). */
+}
+
+static void
+daemon_claim_header_write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct app_context_t *ctx = cb_arg;
+
+	if (bdev_io != NULL)
+		spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		SPDK_ERRLOG("failed to record segment %u's claim in the volume header\n",
+			    ctx->segment_id);
+		chrono_admin_fulfill(&ctx->admin_req, -EIO);
+		return;
+	}
+
+	atomic_store_explicit(&ctx->mirror_next_segment_id, ctx->vol.next_segment_id,
+			       memory_order_relaxed);
+
+	ctx->next_write_block = ctx->segment_start_block;
+	ctx->cur_buf = 0;
+	for (int i = 0; i < NUM_WRITE_BUFFERS; i++) {
+		ctx->buffers[i].used = 0;
+		ctx->buffers[i].in_flight = false;
+	}
+	atomic_store_explicit(&ctx->record_count, 0, memory_order_relaxed);
+	atomic_store_explicit(&ctx->dropped_count, 0, memory_order_relaxed);
+	atomic_store_explicit(&ctx->first_capture_tsc, 0, memory_order_relaxed);
+	atomic_store_explicit(&ctx->last_capture_tsc, 0, memory_order_relaxed);
+	ctx->stopping = false;
+
+	atomic_store_explicit(&ctx->current_segment_id, ctx->segment_id, memory_order_relaxed);
+	atomic_store_explicit(&ctx->recording, true, memory_order_relaxed);
+
+	ctx->rx_poller = spdk_poller_register(capture_poll, ctx, 0);
+
+	SPDK_NOTICELOG("Recording UDP port %u to bdev %s, segment %u\n",
+		       ctx->opts.udp_port, ctx->opts.bdev_name, ctx->segment_id);
+
+	chrono_admin_fulfill(&ctx->admin_req, 0);
+}
+
+static void
+daemon_claim_toc_write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct app_context_t *ctx = cb_arg;
+	int rc;
+
+	if (bdev_io != NULL)
+		spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		SPDK_ERRLOG("failed to claim a segment slot\n");
+		chrono_admin_fulfill(&ctx->admin_req, -EIO);
+		return;
+	}
+
+	ctx->vol.next_segment_id++;
+	memset(ctx->vol_buf, 0, ctx->block_size);
+	*(struct chrono_volume_header *)ctx->vol_buf = ctx->vol;
+
+	rc = spdk_bdev_write(ctx->bdev_desc, ctx->bdev_io_channel, ctx->vol_buf,
+			      VOLUME_HEADER_BLOCK * ctx->block_size, ctx->block_size,
+			      daemon_claim_header_write_complete, ctx);
+	if (rc != 0) {
+		SPDK_ERRLOG("%s recording segment claim in volume header\n", spdk_strerror(-rc));
+		chrono_admin_fulfill(&ctx->admin_req, rc);
+	}
+}
+
+/* Called by admin_do_recording_start() (chrono_admin.c) once it's
+ * confirmed the daemon isn't shutting down/already recording and applied
+ * any per-session port/count_limit override. */
+void
+daemon_claim_segment_start(struct app_context_t *ctx)
+{
+	struct chrono_segment_entry *seg;
+	struct timespec ts;
+	int rc;
+
+	if (ctx->vol.next_segment_id >= ctx->vol.toc_slot_count) {
+		SPDK_ERRLOG("TOC full (%u/%u segments used) - re-init the device"
+			    " (--init --force) to reclaim slots\n",
+			    ctx->vol.next_segment_id, ctx->vol.toc_slot_count);
+		chrono_admin_fulfill(&ctx->admin_req, -ENOSPC);
+		return;
+	}
+
+	ctx->segment_id = ctx->vol.next_segment_id;
+	ctx->segment_start_block = ctx->vol.next_data_block;
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	ctx->segment_wall_start_sec = (uint64_t)ts.tv_sec;
+	ctx->segment_wall_start_nsec = (uint32_t)ts.tv_nsec;
+
+	memset(ctx->io_buf, 0, ctx->block_size);
+	seg = (struct chrono_segment_entry *)ctx->io_buf;
+	seg->magic = CHRONO_SEGMENT_MAGIC;
+	seg->segment_id = ctx->segment_id;
+	seg->state = CHRONO_SEGMENT_OPEN;
+	seg->start_block = ctx->segment_start_block;
+	seg->wall_clock_start_sec = ctx->segment_wall_start_sec;
+	seg->wall_clock_start_nsec = ctx->segment_wall_start_nsec;
+
+	rc = spdk_bdev_write(ctx->bdev_desc, ctx->bdev_io_channel, ctx->io_buf,
+			      (ctx->vol.toc_start_block + ctx->segment_id) * ctx->block_size,
+			      ctx->block_size, daemon_claim_toc_write_complete, ctx);
+	if (rc != 0) {
+		SPDK_ERRLOG("%s claiming segment %u\n", spdk_strerror(-rc), ctx->segment_id);
+		chrono_admin_fulfill(&ctx->admin_req, rc);
+	}
+}
+
+/* Sets shutting_down (and, transitively via the web thread's own poll of
+ * it, the web server's quit flag) as the very first action, before any
+ * bdev/segment teardown - see the shutdown-safety design in the
+ * project's plan for why this ordering matters. */
+static void
+daemon_shutdown_cb(void)
+{
+	struct app_context_t *ctx = &g_ctx;
+
+	atomic_store_explicit(&ctx->shutting_down, true, memory_order_relaxed);
+
+	if (atomic_load_explicit(&ctx->recording, memory_order_relaxed))
+		daemon_stop_recording(ctx);
+	else
+		daemon_teardown_and_exit(ctx);
+}
+
+static void
+daemon_bring_up_networking(struct app_context_t *ctx)
+{
+	if (rte_eth_dev_count_avail() != 1) {
+		SPDK_ERRLOG("Expected exactly 1 available DPDK port, found %u\n",
+			    rte_eth_dev_count_avail());
+		fail_started(ctx);
+		return;
+	}
+	RTE_ETH_FOREACH_DEV(ctx->port)
+		break;
+
+	ctx->mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS, MBUF_CACHE_SIZE, 0,
+						  MBUF_DATA_SIZE, rte_socket_id());
+	if (ctx->mbuf_pool == NULL) {
+		SPDK_ERRLOG("Cannot create mbuf pool: %s\n", rte_strerror(rte_errno));
+		fail_started(ctx);
+		return;
+	}
+
+	struct rte_ether_addr mac_addr;
+	int rc = chrono_port_init(ctx->port, ctx->mbuf_pool, ctx->opts.mtu, ctx->opts.force_10g,
+				   &mac_addr);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to initialize port %u\n", ctx->port);
+		fail_started(ctx);
+		return;
+	}
+
+	uint32_t buf_align = spdk_bdev_get_buf_align(ctx->bdev);
+	for (int i = 0; i < NUM_WRITE_BUFFERS; i++) {
+		ctx->buffers[i].data = spdk_dma_zmalloc(ctx->buf_size, buf_align, NULL);
+		if (!ctx->buffers[i].data) {
+			SPDK_ERRLOG("Failed to allocate write buffer %d\n", i);
+			fail_started(ctx);
+			return;
+		}
+	}
+
+	if (chrono_admin_init(ctx) != 0) {
+		SPDK_ERRLOG("Failed to initialize the admin bridge\n");
+		fail_started(ctx);
+		return;
+	}
+	ctx->app_thread = spdk_get_thread();
+	ctx->start_time = time(NULL);
+	atomic_store_explicit(&ctx->current_segment_id, CHRONO_NO_SEGMENT, memory_order_relaxed);
+	atomic_store_explicit(&ctx->mirror_next_segment_id, ctx->vol.next_segment_id,
+			       memory_order_relaxed);
+	atomic_store_explicit(&ctx->mirror_next_data_block, ctx->vol.next_data_block,
+			       memory_order_relaxed);
+	ctx->cached_num_blocks = spdk_bdev_get_num_blocks(ctx->bdev);
+
+	/* Everything above this point must be written before the web
+	 * thread is created below - pthread_create() is itself a
+	 * synchronization point, so no atomics are needed for the plain
+	 * fields it just set (app_thread, start_time, cached_num_blocks,
+	 * ctx->vol.*) to be safely visible on that thread from here on. */
+	if (ctx->opts.web_port != 0) {
+		if (web_status_start(ctx->opts.web_port, ctx) != 0) {
+			SPDK_ERRLOG("Failed to start the web server on port %u\n",
+				    ctx->opts.web_port);
+			fail_started(ctx);
+			return;
+		}
+		SPDK_NOTICELOG("Web UI listening on port %u\n", ctx->opts.web_port);
+	}
+
+	SPDK_NOTICELOG("Daemon ready: bdev %s, port %u, %u/%u segments already recorded\n",
+		       ctx->opts.bdev_name, ctx->port, ctx->vol.next_segment_id,
+		       ctx->vol.toc_slot_count);
+}
+
+static void
+daemon_volume_header_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct app_context_t *ctx = cb_arg;
+	struct chrono_volume_header *hdr = (struct chrono_volume_header *)ctx->vol_buf;
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		SPDK_ERRLOG("failed to read the volume header\n");
+		fail_started(ctx);
+		return;
+	}
+	if (!volume_header_is_valid(hdr)) {
+		SPDK_ERRLOG("no valid chrontabulator volume on %s - run with --init first\n",
+			    ctx->opts.bdev_name);
+		fail_started(ctx);
+		return;
+	}
+
+	ctx->vol = *hdr;
+	if (ctx->vol.block_size != ctx->block_size) {
+		SPDK_ERRLOG("volume was formatted with block_size=%u, but %s currently"
+			    " reports block_size=%u - refusing to trust its offsets\n",
+			    ctx->vol.block_size, ctx->opts.bdev_name, ctx->block_size);
+		fail_started(ctx);
+		return;
+	}
+
+	daemon_bring_up_networking(ctx);
+}
+
+static void
+daemon_start(struct app_context_t *ctx)
+{
+	int rc;
+
+	rc = spdk_bdev_read(ctx->bdev_desc, ctx->bdev_io_channel, ctx->vol_buf,
+			     VOLUME_HEADER_BLOCK * ctx->block_size, ctx->block_size,
+			     daemon_volume_header_read_complete, ctx);
+	if (rc != 0) {
+		SPDK_ERRLOG("%s reading the volume header\n", spdk_strerror(-rc));
+		fail_started(ctx);
+	}
+}
+
 static void
 app_started(void *arg1)
 {
@@ -1122,13 +1484,16 @@ app_started(void *arg1)
 		spdk_app_stop(-1);
 		return;
 	}
-	if (!ctx->opts.dump_mode && !ctx->opts.init_mode && ctx->opts.udp_port == 0) {
-		SPDK_ERRLOG("-P <port> is required unless -D or --init is given\n");
+	if (!ctx->opts.dump_mode && !ctx->opts.init_mode && !ctx->opts.serve_mode &&
+	    ctx->opts.udp_port == 0) {
+		SPDK_ERRLOG("-P <port> is required unless -D, --init, or --serve is given\n");
 		spdk_app_stop(-1);
 		return;
 	}
-	if (ctx->opts.init_mode && ctx->opts.dump_mode) {
-		SPDK_ERRLOG("--init and -D can't be used together\n");
+	if ((ctx->opts.init_mode && ctx->opts.dump_mode) ||
+	    (ctx->opts.init_mode && ctx->opts.serve_mode) ||
+	    (ctx->opts.dump_mode && ctx->opts.serve_mode)) {
+		SPDK_ERRLOG("--init, -D, and --serve can't be used together\n");
 		spdk_app_stop(-1);
 		return;
 	}
@@ -1185,6 +1550,10 @@ app_started(void *arg1)
 		init_start(ctx);
 		return;
 	}
+	if (ctx->opts.serve_mode) {
+		daemon_start(ctx);
+		return;
+	}
 
 	rc = spdk_bdev_read(ctx->bdev_desc, ctx->bdev_io_channel, ctx->vol_buf,
 			     VOLUME_HEADER_BLOCK * ctx->block_size, ctx->block_size,
@@ -1202,19 +1571,30 @@ main(int argc, char **argv)
 	int rc;
 
 	memset(&g_ctx, 0, sizeof(g_ctx));
+	g_ctx.opts.web_port = 8080; /* --web-port=0 (explicitly passed) is what
+				     * means headless - see app_parse_arg(). */
 
 	spdk_app_opts_init(&opts, sizeof(opts));
 	opts.name = "chrontabulator";
-	opts.shutdown_cb = app_shutdown_cb;
 
 	rc = spdk_app_parse_args(argc, argv, &opts, "b:P:M:FC:DS:", chrono_long_opts,
 				  app_parse_arg, app_usage);
 	if (rc != SPDK_APP_PARSE_ARGS_SUCCESS)
 		exit(rc);
 
+	opts.shutdown_cb = g_ctx.opts.serve_mode ? daemon_shutdown_cb : app_shutdown_cb;
+
 	rc = spdk_app_start(&opts, app_started, &g_ctx);
 	if (rc)
 		SPDK_ERRLOG("ERROR starting application\n");
+
+	/* Must run after spdk_app_start() returns (the reactor OS thread is
+	 * done by then) and before spdk_app_fini() - never from inside a
+	 * reactor callback, since the web thread's accept loop may be
+	 * blocked in a bridged admin call that only the reactor thread can
+	 * complete. See web_status.h. */
+	if (g_ctx.opts.serve_mode)
+		web_status_stop();
 
 	spdk_app_fini();
 	return rc;

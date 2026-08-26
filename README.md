@@ -117,6 +117,37 @@ No NIC/DPDK setup happens in dump/list or `--init` modes - `-P` isn't
 required, and `-A` only matters because SPDK still parses it from the
 combined arg list even though nothing uses it here.
 
+**Daemon + web UI** (persistent process - brings the NIC up once, then
+recording is started/stopped repeatedly from a browser without paying
+that cost again):
+```
+./chrontabulator -A <nic-pci-addr> -c <bdev.json> -b <bdev-name> --serve [--web-port=<port>] [-P <default-port>] [-C <default-count>]
+```
+Open `http://<host>:<web-port>/` (default 8080, `0` = headless/no web
+server). `-P`/`-C` given at startup become defaults for sessions started
+from the UI (or via `POST /recording/start?port=&count_limit=`), not a
+hard requirement - the port can also be set per-session from the page.
+`-M`/`-F` are daemon-start-time only (tied to the one-time NIC bring-up).
+
+The dashboard shows live NIC/NVMe housekeeping, lets you start/stop
+recording, browse the table of contents, and view or delete a segment
+(`/segments.json`, `/segments/<id>/records.json` - paginated,
+`?offset=&limit=`, capped at 2000/request - and `POST
+/segments/<id>/delete`). Deleting a segment hides it from the default
+listing (`?include_deleted=1` shows it again with its original counts
+intact) but doesn't reclaim its disk space, same as an orphaned segment.
+"Delete" here is distinct from real playback/re-transmission, which isn't
+built yet - viewing a segment's records is read-only.
+
+SPDK's bdev/thread APIs can't be called off the reactor thread, so the
+embedded web server runs on its own pthread (same accept-loop shape as
+`dpdk-app-example`'s `web_status.c`) and bridges any request that needs
+real I/O (start/stop, segment list/records/delete) back onto the reactor
+via `spdk_thread_send_msg()` plus a bounded (3s) condvar wait - see
+`src/chrono_admin.c`. Pure status polling (`/status.json`, NIC link/hw
+stats, live record counts) is served directly from lock-free atomics, no
+bridging needed.
+
 ## On-disk format
 
 See `src/record.h` for the exact layout. Block 0 holds a
@@ -138,7 +169,9 @@ signal a later sorted-replay pass should use.
 
 Working now: capture to independently-addressable segments on one
 device, `-D`/`-D -S` listing and per-segment readback verification, safe
-device `--init`. Planned, not started: network/storage housekeeping, and
-a management web page for storage/playback/hardware status - mirroring
-`dpdk-app-example`'s existing status UI. Sorted replay across segments
-remains a later phase too.
+device `--init`, and a persistent `--serve` daemon with an embedded web
+UI for live NIC/NVMe housekeeping, recording control, and browsing/
+deleting/viewing segments. Planned, not started: real playback
+(re-transmitting a segment's captured packets, as opposed to today's
+read-only view/export), and sorted replay across segments by
+`capture_tsc`.
