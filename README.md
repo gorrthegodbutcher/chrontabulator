@@ -76,9 +76,19 @@ instead: one external DPDK build, everything link-time static.)
 
 ## Usage
 
-**Capture:**
+A device must be formatted once before its first capture:
 ```
-./chrontabulator -A <nic-pci-addr> -c <nvme_bdev.json> -b <bdev-name> -P <udp-port> [-C <count>] [-M <mtu>] [-F]
+./chrontabulator -A <nic-pci-addr> -c <bdev.json> -b <bdev-name> --init [--force]
+```
+`--force` is required to reformat a device that already has a
+chrontabulator volume (any version) or a legacy pre-segment capture on
+it - a blank/foreign device doesn't need it. Reformatting makes every
+existing segment on the device unreadable.
+
+**Capture** (each run claims its own segment - multiple captures can
+coexist on one formatted device without overwriting each other):
+```
+./chrontabulator -A <nic-pci-addr> -c <bdev.json> -b <bdev-name> -P <udp-port> [-C <count>] [-M <mtu>] [-F]
 ```
 - `-c` - SPDK bdev config JSON (see `testdata/nvme_bdev.json` for the
   `bdev_nvme_attach_controller` template - point `traddr` at the capture
@@ -90,35 +100,45 @@ instead: one external DPDK build, everything link-time static.)
 - `-M` / `-F` - MTU / restrict to 10G link speed, same meaning as the
   equivalent `dpdk-app-example` receiver flags
 
-Ctrl+C (or `-C` being reached) flushes any partially-full write buffer,
-writes the superblock, and exits cleanly.
+Ctrl+C (or `-C` being reached) flushes any partially-full write buffer and
+finalizes the segment cleanly. A segment killed before finalizing (crash,
+`kill -9`) shows up as `OPEN` in `-D`'s listing - its data isn't lost, but
+its space gets silently reused by the next capture that runs (recovering
+an orphaned segment is out of scope for now).
 
-**Dump** (reads a previous capture back and prints it, to verify the
-on-disk format without trusting a long run blind):
+**List segments** (default `-D` behavior) or **dump one segment's
+records** (to verify the on-disk format without trusting a long run
+blind):
 ```
-./chrontabulator -A <nic-pci-addr> -c <nvme_bdev.json> -b <bdev-name> -D
+./chrontabulator -A <nic-pci-addr> -c <bdev.json> -b <bdev-name> -D
+./chrontabulator -A <nic-pci-addr> -c <bdev.json> -b <bdev-name> -D -S <segment-id>
 ```
-No NIC/DPDK setup happens in this mode - `-P` isn't required, and `-A`
-only matters because SPDK still parses it from the combined arg list even
-though nothing uses it here.
+No NIC/DPDK setup happens in dump/list or `--init` modes - `-P` isn't
+required, and `-A` only matters because SPDK still parses it from the
+combined arg list even though nothing uses it here.
 
 ## On-disk format
 
-See `src/record.h` for the exact layout (`chrono_record_hdr` /
-`chrono_superblock`). Records are written back-to-back into fixed-size
-chunks sized to the bdev's write-unit granularity, zero-padded at flush
-time so a reader can always tell real records from unwritten space via
-`magic == 0`. Each record carries the sender's own sequence number *and*
-this recorder's own `rte_rdtsc()` capture timestamp - the sequence number
-alone resets across sender restarts and isn't ordering-authoritative on
-its own, so `capture_tsc` is the real signal a later sorted-replay pass
-should use.
+See `src/record.h` for the exact layout. Block 0 holds a
+`chrono_volume_header` (written once by `--init`); a fixed table of
+contents right after it holds one `chrono_segment_entry` per capture
+segment; segment data fills the rest of the device, allocated by a
+high-water mark that only advances when a segment finalizes cleanly - an
+orphaned (crashed) segment just gets silently overwritten by the next
+run, never leaked space. Records within a segment are written back-to-back
+into fixed-size chunks sized to the bdev's write-unit granularity,
+zero-padded at flush time so a reader can always tell real records from
+unwritten space via `magic == 0`. Each record carries the sender's own
+sequence number *and* this recorder's own `rte_rdtsc()` capture
+timestamp - the sequence number alone resets across sender restarts and
+isn't ordering-authoritative on its own, so `capture_tsc` is the real
+signal a later sorted-replay pass should use.
 
 ## Roadmap
 
-Working now: single-segment capture-to-NVMe, `-D` readback verification.
-Planned, not started: network/storage housekeeping, a real table-of-
-contents with a segment index (so specific time ranges can be retrieved
-without scanning the whole device), and a management web page for
-storage/playback/hardware status - mirroring `dpdk-app-example`'s
-existing status UI.
+Working now: capture to independently-addressable segments on one
+device, `-D`/`-D -S` listing and per-segment readback verification, safe
+device `--init`. Planned, not started: network/storage housekeeping, and
+a management web page for storage/playback/hardware status - mirroring
+`dpdk-app-example`'s existing status UI. Sorted replay across segments
+remains a later phase too.
