@@ -198,6 +198,22 @@ struct chrono_segment_entry {
 	uint64_t block_count;           /* blocks actually written by this
 					  * segment. 0 while OPEN; set once, at
 					  * finalize. */
+	uint32_t write_chunk_bytes;     /* ctx->buf_size at claim time - the
+					  * write chunk size this segment's
+					  * data was actually packed with.
+					  * Write chunk size is live-tunable
+					  * per daemon session (see
+					  * MAX_WRITE_BUFFERS's comment in
+					  * chrono_ctx.h), so it can differ
+					  * segment to segment, or from
+					  * whatever a later reader's own
+					  * ctx->buf_size happens to be -
+					  * readers MUST use this stored value
+					  * (not their own current buf_size) to
+					  * walk this segment's records, or a
+					  * chunk-boundary zero-padding gap
+					  * lands at the wrong offset and looks
+					  * like a corrupt/overrunning record. */
 	uint64_t record_count;
 	uint64_t dropped_count;
 	uint64_t first_capture_tsc;     /* rte_rdtsc() of this segment's

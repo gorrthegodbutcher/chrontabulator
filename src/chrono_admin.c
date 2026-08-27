@@ -256,7 +256,7 @@ admin_records_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, vo
 		return;
 	}
 
-	while (off + sizeof(struct chrono_record_hdr) <= ctx->buf_size &&
+	while (off + sizeof(struct chrono_record_hdr) <= ctx->dump_write_chunk_bytes &&
 	       ctx->dump_records_seen < ctx->dump_target_count &&
 	       req->scan_collected < req->req_limit) {
 		struct chrono_record_hdr *hdr = (struct chrono_record_hdr *)(ctx->io_buf + off);
@@ -268,7 +268,7 @@ admin_records_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, vo
 			ctx->dump_records_seen = ctx->dump_target_count;
 			break;
 		}
-		if (off + sizeof(*hdr) + hdr->len > ctx->buf_size) {
+		if (off + sizeof(*hdr) + hdr->len > ctx->dump_write_chunk_bytes) {
 			chrono_admin_fulfill(req, -EIO);
 			return;
 		}
@@ -312,13 +312,13 @@ admin_records_read_next_chunk(struct app_context_t *ctx)
 	}
 
 	rc = spdk_bdev_read(ctx->bdev_desc, ctx->bdev_io_channel, ctx->io_buf,
-			     ctx->dump_cur_block * ctx->block_size, ctx->buf_size,
+			     ctx->dump_cur_block * ctx->block_size, ctx->dump_write_chunk_bytes,
 			     admin_records_chunk_read_complete, ctx);
 	if (rc != 0) {
 		chrono_admin_fulfill(req, rc);
 		return;
 	}
-	ctx->dump_cur_block += ctx->buf_size_blocks;
+	ctx->dump_cur_block += ctx->dump_write_chunk_blocks;
 }
 
 static void
@@ -355,6 +355,14 @@ admin_records_entry_read_complete(struct spdk_bdev_io *bdev_io, bool success, vo
 	ctx->dump_cur_block = seg->start_block;
 	ctx->dump_records_seen = 0;
 	req->scan_collected = 0;
+	/* 0 means this segment predates write_chunk_bytes being recorded -
+	 * fall back to this process's own buf_size, the old implicit
+	 * assumption. See record.h's chrono_segment_entry.write_chunk_bytes
+	 * and main.c's dump_segment_entry_read_complete() for why a reader
+	 * can't just use its own current ctx->buf_size here. */
+	ctx->dump_write_chunk_bytes = seg->write_chunk_bytes != 0 ?
+		seg->write_chunk_bytes : ctx->buf_size;
+	ctx->dump_write_chunk_blocks = ctx->dump_write_chunk_bytes / ctx->block_size;
 
 	if (ctx->dump_target_count == 0 || req->req_offset >= ctx->dump_target_count) {
 		admin_buf_appendf(req,

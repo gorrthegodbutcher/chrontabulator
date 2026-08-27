@@ -224,6 +224,16 @@ struct app_context_t {
 	uint64_t dump_cur_block;
 	uint64_t dump_first_capture_tsc;
 	uint64_t dump_tsc_hz;
+	/* "-S <id>: dump one segment" only - the segment's own stored
+	 * write_chunk_bytes (chrono_segment_entry, record.h), NOT this
+	 * process's own ctx->buf_size. Write chunk size is live-tunable per
+	 * daemon session, so a segment recorded at one chunk size must still
+	 * be read back at that same size regardless of whatever buf_size
+	 * this reading process happens to be running with, or a chunk-
+	 * boundary zero-padding gap lands at the wrong offset and looks like
+	 * a corrupt/overrunning record - see dump_segment_entry_read_complete(). */
+	uint32_t dump_write_chunk_bytes;
+	uint32_t dump_write_chunk_blocks;
 
 	/* --serve (daemon) mode only. */
 	_Atomic bool recording;

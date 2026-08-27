@@ -843,6 +843,7 @@ claim_segment_start(struct app_context_t *ctx)
 	seg->segment_id = ctx->segment_id;
 	seg->state = CHRONO_SEGMENT_OPEN;
 	seg->start_block = ctx->segment_start_block;
+	seg->write_chunk_bytes = ctx->buf_size;
 	seg->wall_clock_start_sec = ctx->segment_wall_start_sec;
 	seg->wall_clock_start_nsec = ctx->segment_wall_start_nsec;
 
@@ -874,13 +875,13 @@ dump_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_ar
 		return;
 	}
 
-	while (offset + sizeof(struct chrono_record_hdr) <= ctx->buf_size &&
+	while (offset + sizeof(struct chrono_record_hdr) <= ctx->dump_write_chunk_bytes &&
 	       ctx->dump_records_seen < ctx->dump_target_count) {
 		struct chrono_record_hdr *hdr = (struct chrono_record_hdr *)(ctx->io_buf + offset);
 
 		if (hdr->magic != CHRONO_RECORD_MAGIC)
 			break;
-		if (offset + sizeof(*hdr) + hdr->len > ctx->buf_size) {
+		if (offset + sizeof(*hdr) + hdr->len > ctx->dump_write_chunk_bytes) {
 			SPDK_ERRLOG("record at block %" PRIu64 " offset %u claims len %u,"
 				    " overruns the write chunk - stopping\n",
 				    ctx->dump_cur_block, offset, hdr->len);
@@ -898,7 +899,7 @@ dump_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_ar
 		ctx->dump_records_seen++;
 	}
 
-	ctx->dump_cur_block += ctx->buf_size_blocks;
+	ctx->dump_cur_block += ctx->dump_write_chunk_blocks;
 
 	if (ctx->dump_records_seen >= ctx->dump_target_count) {
 		printf("Dumped %" PRIu64 " of %" PRIu64 " records from segment %u.\n",
@@ -925,7 +926,7 @@ dump_read_next_chunk(struct app_context_t *ctx)
 	int rc;
 
 	rc = spdk_bdev_read(ctx->bdev_desc, ctx->bdev_io_channel, ctx->io_buf,
-			     ctx->dump_cur_block * ctx->block_size, ctx->buf_size,
+			     ctx->dump_cur_block * ctx->block_size, ctx->dump_write_chunk_bytes,
 			     dump_chunk_read_complete, ctx);
 	if (rc != 0) {
 		SPDK_ERRLOG("%s reading block %" PRIu64 "\n", spdk_strerror(-rc), ctx->dump_cur_block);
@@ -973,6 +974,12 @@ dump_segment_entry_read_complete(struct spdk_bdev_io *bdev_io, bool success, voi
 	ctx->dump_target_count = seg->record_count;
 	ctx->dump_first_capture_tsc = seg->first_capture_tsc;
 	ctx->dump_tsc_hz = seg->tsc_hz;
+	/* 0 means this segment predates write_chunk_bytes being recorded
+	 * (an older binary) - fall back to this process's own buf_size, the
+	 * old implicit assumption, rather than divide by zero below. */
+	ctx->dump_write_chunk_bytes = seg->write_chunk_bytes != 0 ?
+		seg->write_chunk_bytes : ctx->buf_size;
+	ctx->dump_write_chunk_blocks = ctx->dump_write_chunk_bytes / ctx->block_size;
 
 	if (ctx->dump_target_count == 0) {
 		printf("Nothing recorded in this segment.\n");
@@ -1537,6 +1544,7 @@ daemon_claim_segment_start(struct app_context_t *ctx)
 	seg->segment_id = ctx->segment_id;
 	seg->state = CHRONO_SEGMENT_OPEN;
 	seg->start_block = ctx->segment_start_block;
+	seg->write_chunk_bytes = ctx->buf_size;
 	seg->wall_clock_start_sec = ctx->segment_wall_start_sec;
 	seg->wall_clock_start_nsec = ctx->segment_wall_start_nsec;
 
@@ -1974,7 +1982,17 @@ app_started(void *arg1)
 		fail_started(ctx);
 		return;
 	}
-	ctx->io_buf = spdk_dma_zmalloc(ctx->buf_size, buf_align, NULL);
+	/* MAX_WRITE_CHUNK_BYTES, not ctx->buf_size: io_buf is shared by every
+	 * read/write that uses "the current chunk size" as its length -
+	 * quick-format's zero-fill, and (via the segment's own stored
+	 * write_chunk_bytes - see chrono_segment_entry) dump/list's per-
+	 * segment record reads. buf_size can grow at runtime (live tuning,
+	 * gated to !recording - see MAX_WRITE_BUFFERS's comment in
+	 * chrono_ctx.h), and io_buf is allocated once here, before any of
+	 * that can happen - sizing it to ctx->buf_size's startup value would
+	 * leave every later, larger read/write past that point writing off
+	 * the end of this allocation. */
+	ctx->io_buf = spdk_dma_zmalloc(MAX_WRITE_CHUNK_BYTES, buf_align, NULL);
 	if (!ctx->io_buf) {
 		SPDK_ERRLOG("Failed to allocate I/O buffer\n");
 		fail_started(ctx);
