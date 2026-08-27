@@ -519,8 +519,36 @@ retry_flush(void *arg)
 	struct app_context_t *ctx = &g_ctx;
 	int rc;
 
+	/* wb->target_block, not ctx->next_write_block: this can run long
+	 * after the buffer was originally handed off (queued via
+	 * spdk_bdev_queue_io_wait() below, then re-fired later by SPDK once
+	 * some unrelated I/O completes), by which point ctx->next_write_block
+	 * has moved on to whatever buffer flushed after this one. Using the
+	 * live value here would write this buffer to the WRONG block - and
+	 * if that drifted-to position happens to be past the device end, the
+	 * write fails every time it's retried with no way to ever succeed,
+	 * while SPDK keeps re-queuing/re-firing it on every later completion:
+	 * a permanent, silent hot loop that also drove ctx->pending_writes
+	 * deeply negative (repeated failures here with no matching
+	 * flush_buffer() increment), permanently blocking finalize. Checking
+	 * bounds against the buffer's own fixed target, once, before ever
+	 * calling spdk_bdev_write(), turns that into a single clean failure. */
+	if (wb->target_block + ctx->buf_size_blocks > ctx->cached_num_blocks) {
+		SPDK_ERRLOG("abandoning write buffer targeting block %" PRIu64
+			    " - past device end (%" PRIu64 ")\n",
+			    wb->target_block, ctx->cached_num_blocks);
+		atomic_fetch_add_explicit(&ctx->write_errors_total, 1, memory_order_relaxed);
+		wb->in_flight = false;
+		wb->used = 0;
+		ctx->pending_writes--;
+		chrono_note_write_failure(ctx);
+		if (ctx->stopping && ctx->pending_writes == 0)
+			finalize_current_stop(ctx);
+		return;
+	}
+
 	rc = spdk_bdev_write(ctx->bdev_desc, ctx->bdev_io_channel, wb->data,
-			      ctx->next_write_block * ctx->block_size, ctx->buf_size,
+			      wb->target_block * ctx->block_size, ctx->buf_size,
 			      write_complete, wb);
 	if (rc == -ENOMEM) {
 		ctx->retry_buf = wb;
@@ -581,6 +609,7 @@ flush_buffer(struct app_context_t *ctx, int idx)
 		memset(wb->data + wb->used, 0, ctx->buf_size - wb->used);
 
 	wb->in_flight = true;
+	wb->target_block = ctx->next_write_block;
 	ctx->pending_writes++;
 	retry_flush(wb);
 	ctx->next_write_block += ctx->buf_size_blocks;

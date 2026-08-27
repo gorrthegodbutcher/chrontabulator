@@ -109,6 +109,12 @@ struct write_buf {
 	uint8_t *data;
 	uint32_t used;
 	bool in_flight;
+	uint64_t target_block; /* device-absolute block this buffer was
+				 * assigned to, captured once by flush_buffer()
+				 * when it's handed off - retry_flush() must
+				 * write here, not wherever ctx->next_write_block
+				 * has drifted to by the time a queued retry
+				 * actually fires (see retry_flush()'s comment). */
 };
 
 /* Sentinel for "no segment currently recording" - 0 is a valid segment id,
