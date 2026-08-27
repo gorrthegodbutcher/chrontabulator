@@ -671,6 +671,26 @@ capture_poll(void *arg)
 		uint32_t rec_size = (uint32_t)sizeof(struct chrono_record_hdr) + payload_len;
 		struct write_buf *wb = &ctx->buffers[ctx->cur_buf];
 
+		if (wb->in_flight) {
+			/* cur_buf's previous write hasn't completed yet (all
+			 * write_buf_count buffers are backed up) - the round-
+			 * robin below never got to advance past it, so every
+			 * packet that lands here would otherwise fall into the
+			 * "doesn't fit" branch and call flush_buffer() on this
+			 * SAME still in_flight buffer again: a second, concurrent
+			 * spdk_bdev_write() of the same DMA memory the first
+			 * write hasn't finished reading yet, and one extra
+			 * pending_writes++ per packet instead of one per genuine
+			 * flush - this is what ran pending_writes up into the
+			 * millions and made it look like recording could never
+			 * be stopped (finalize waits for pending_writes==0, which
+			 * a runaway counter like that never reaches). Just drop
+			 * and wait for write_complete() to free this buffer up. */
+			atomic_fetch_add_explicit(&ctx->dropped_count, 1, memory_order_relaxed);
+			rte_pktmbuf_free(bufs[i]);
+			continue;
+		}
+
 		if (wb->used + rec_size > ctx->buf_size) {
 			/* Doesn't fit in what's left of this buffer - flush
 			 * it (flush_buffer() pads the remainder with zeros)
