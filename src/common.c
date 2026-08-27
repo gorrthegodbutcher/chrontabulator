@@ -111,7 +111,21 @@ app_build_packet(uint8_t *buf, uint32_t buf_capacity, uint32_t total_pkt_len,
 
 	/* IPv4 */
 	uint8_t *ip = buf + ETH_HDR_LEN;
-	uint32_t ip_total_len = IPV4_HDR_LEN + UDP_HDR_LEN + SEQ_LEN + payload_len;
+	/* Derived from total_pkt_len, NOT payload_len - a caller building a
+	 * fixed-size packet with a real payload shorter than total_pkt_len
+	 * (e.g. run_seq_mode()'s --size=N with payload=NULL,0, relying on
+	 * the zero-padding below to reach N bytes) needs the header's own
+	 * declared length to cover that full padded size. Using payload_len
+	 * alone here was a real bug: the zero-padding was written to the
+	 * buffer correctly, but the IP/UDP headers declared a much shorter
+	 * packet, so any correct parser (including this project's own
+	 * app_parse_packet()) read back payload_len=0 for every "512-byte"
+	 * packet sent this way - confirmed live via chrontabulator capturing
+	 * real traffic and seeing len=0 on every record despite genuinely
+	 * larger frames on the wire. total_pkt_len is already validated
+	 * above (>= APP_HDR_LEN + payload_len), so this is always >= the
+	 * minimum header size. */
+	uint32_t ip_total_len = total_pkt_len - ETH_HDR_LEN;
 	ip[0] = 0x45;
 	ip[1] = 0x00;
 	put_be16(ip + 2, (uint16_t)ip_total_len);
@@ -126,7 +140,8 @@ app_build_packet(uint8_t *buf, uint32_t buf_capacity, uint32_t total_pkt_len,
 
 	/* UDP */
 	uint8_t *udp = ip + IPV4_HDR_LEN;
-	uint32_t udp_len = UDP_HDR_LEN + SEQ_LEN + payload_len;
+	/* Same total_pkt_len-derived fix as ip_total_len above. */
+	uint32_t udp_len = total_pkt_len - ETH_HDR_LEN - IPV4_HDR_LEN;
 	put_be16(udp, src_port);
 	put_be16(udp + 2, dst_port);
 	put_be16(udp + 4, (uint16_t)udp_len);
