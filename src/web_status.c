@@ -264,12 +264,14 @@ render_status_json(struct app_context_t *ctx, char *out, size_t out_size)
 		"  \"max_write_buffers\": %d,\n"
 		"  \"write_chunk_bytes\": %u,\n"
 		"  \"max_write_chunk_bytes\": %d,\n"
+		"  \"wire_has_seq\": %s,\n"
 		"  \"startup_mtu\": %u,\n"
 		"  \"startup_force_10g\": %s,\n"
 		"  \"startup_udp_port\": %u,\n"
 		"  \"startup_count_limit\": %" PRIu64 ",\n"
 		"  \"startup_write_buf_count\": %u,\n"
-		"  \"startup_write_chunk_bytes\": %u\n"
+		"  \"startup_write_chunk_bytes\": %u,\n"
+		"  \"startup_wire_has_seq\": %s\n"
 		"}\n",
 		(long)(time(NULL) - ctx->start_time),
 		recording ? "true" : "false", seg_id_json,
@@ -288,9 +290,11 @@ render_status_json(struct app_context_t *ctx, char *out, size_t out_size)
 		bytes_written, writes_completed, write_errors,
 		ctx->write_buf_count, MAX_WRITE_BUFFERS,
 		ctx->buf_size, MAX_WRITE_CHUNK_BYTES,
+		ctx->wire_has_seq ? "true" : "false",
 		ctx->opts.mtu, ctx->opts.force_10g ? "true" : "false",
 		ctx->opts.udp_port, ctx->opts.count_limit,
-		ctx->opts.write_buf_count, ctx->opts.write_chunk_bytes);
+		ctx->opts.write_buf_count, ctx->opts.write_chunk_bytes,
+		ctx->opts.wire_has_seq ? "true" : "false");
 }
 
 /* EAL/DPDK-level diagnostics, separate from the app-level counters in
@@ -447,6 +451,11 @@ handle_connection(int fd, struct app_context_t *ctx)
 	} else if (strncmp(request_line, "POST /write-chunk", strlen("POST /write-chunk")) == 0) {
 		req->op = CHRONO_ADMIN_SET_WRITE_CHUNK;
 		req->req_write_chunk_bytes = query_get_uint(request_line, "bytes", &v) ? (uint32_t)v : 0;
+		rc = chrono_admin_call(ctx, req, ADMIN_TIMEOUT_SEC);
+		send_admin_result(fd, rc == 0 ? req->rc : rc, req);
+	} else if (strncmp(request_line, "POST /wire-has-seq", strlen("POST /wire-has-seq")) == 0) {
+		req->op = CHRONO_ADMIN_SET_WIRE_HAS_SEQ;
+		req->req_wire_has_seq = query_get_uint(request_line, "value", &v) ? v != 0 : true;
 		rc = chrono_admin_call(ctx, req, ADMIN_TIMEOUT_SEC);
 		send_admin_result(fd, rc == 0 ? req->rc : rc, req);
 	} else {

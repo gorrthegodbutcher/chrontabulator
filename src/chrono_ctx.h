@@ -140,6 +140,12 @@ struct app_context_t {
 	uint32_t write_buf_count; /* ACTIVE buffer count, 1..MAX_WRITE_BUFFERS -
 				    * live-tunable while !recording, same as
 				    * buf_size above */
+	bool wire_has_seq; /* ACTIVE value - live-tunable while !recording (see
+			     * CHRONO_ADMIN_SET_WIRE_HAS_SEQ), same shape as
+			     * write_buf_count/buf_size above. Initialized from
+			     * ctx->opts.wire_has_seq (the CLI startup default,
+			     * still surfaced read-only) at daemon start; only
+			     * this field is ever read by capture_poll(). */
 
 	struct write_buf buffers[MAX_WRITE_BUFFERS]; /* every slot always
 							* allocated at

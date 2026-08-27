@@ -611,6 +611,20 @@ admin_do_write_chunk(struct app_context_t *ctx, struct chrono_admin_request *req
 	daemon_set_write_chunk_bytes(ctx, req->req_write_chunk_bytes);
 }
 
+/* ---- SET_WIRE_HAS_SEQ: same synchronous shape and same recording/claim
+ * guard as the two above - see daemon_set_wire_has_seq()'s comment
+ * (chrono_admin.h) for why this can't change mid-segment. ---- */
+
+static void
+admin_do_wire_has_seq(struct app_context_t *ctx, struct chrono_admin_request *req)
+{
+	if (atomic_load(&ctx->recording) || atomic_load(&ctx->claim_in_progress)) {
+		chrono_admin_fulfill(req, -EBUSY);
+		return;
+	}
+	daemon_set_wire_has_seq(ctx, req->req_wire_has_seq);
+}
+
 void
 chrono_admin_dispatch(void *arg)
 {
@@ -646,6 +660,9 @@ chrono_admin_dispatch(void *arg)
 		break;
 	case CHRONO_ADMIN_SET_WRITE_CHUNK:
 		admin_do_write_chunk(ctx, req);
+		break;
+	case CHRONO_ADMIN_SET_WIRE_HAS_SEQ:
+		admin_do_wire_has_seq(ctx, req);
 		break;
 	default:
 		chrono_admin_fulfill(req, -EINVAL);

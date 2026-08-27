@@ -136,7 +136,10 @@ app_usage(void)
 	printf("                           field is always this capture's self-assigned, gapless\n");
 	printf("                           counter regardless, never taken from the wire. Default:\n");
 	printf("                           expect the prefix (matches dpdk-app-example's own\n");
-	printf("                           default) - use this for real production traffic\n");
+	printf("                           default) - use this for real production traffic.\n");
+	printf("                           Live-tunable from the web UI while not recording\n");
+	printf("                           (POST /wire-has-seq?value=0|1) - this flag only sets\n");
+	printf("                           the daemon's startup value.\n");
 }
 
 static int
@@ -659,7 +662,7 @@ capture_poll(void *arg)
 		const uint8_t *payload;
 		uint32_t payload_len;
 
-		bool is_ours = app_parse_packet(data, len, ctx->opts.wire_has_seq, &dst_port, &seq,
+		bool is_ours = app_parse_packet(data, len, ctx->wire_has_seq, &dst_port, &seq,
 						 &payload, &payload_len) == 0 &&
 				dst_port == ctx->opts.udp_port;
 
@@ -749,7 +752,7 @@ capture_poll(void *arg)
 		 * own gapless/monotonic guarantee (verifiable purely from what
 		 * chrontabulator itself wrote, independent of anything a sender
 		 * did or didn't include) from whatever's actually on the wire.
-		 * ctx->opts.wire_has_seq only controls where app_parse_packet()
+		 * ctx->wire_has_seq only controls where app_parse_packet()
 		 * finds the real payload, never what ends up in this field -
 		 * see common.h's with_seq. A real sender-to-storage sequence
 		 * validator, if ever built, is a separate, pluggable analysis
@@ -1903,6 +1906,14 @@ daemon_set_write_chunk_bytes(struct app_context_t *ctx, uint32_t bytes)
 	chrono_admin_fulfill(&ctx->admin_req, 0);
 }
 
+void
+daemon_set_wire_has_seq(struct app_context_t *ctx, bool wire_has_seq)
+{
+	ctx->wire_has_seq = wire_has_seq;
+	SPDK_NOTICELOG("wire_has_seq set to %s\n", wire_has_seq ? "true" : "false");
+	chrono_admin_fulfill(&ctx->admin_req, 0);
+}
+
 /* Sets shutting_down (and, transitively via the web thread's own poll of
  * it, the web server's quit flag) as the very first action, before any
  * bdev/segment teardown - see the shutdown-safety design in the
@@ -2137,6 +2148,7 @@ app_started(void *arg1)
 	ctx->write_buf_count = ctx->opts.write_buf_count;
 	ctx->buf_size = chrono_round_write_chunk(ctx, ctx->opts.write_chunk_bytes);
 	ctx->buf_size_blocks = ctx->buf_size / ctx->block_size;
+	ctx->wire_has_seq = ctx->opts.wire_has_seq;
 
 	buf_align = spdk_bdev_get_buf_align(ctx->bdev);
 	ctx->vol_buf = spdk_dma_zmalloc(ctx->block_size, buf_align, NULL);

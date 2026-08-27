@@ -39,6 +39,7 @@ enum chrono_admin_op {
 	CHRONO_ADMIN_QUICK_FORMAT,
 	CHRONO_ADMIN_SET_WRITE_BUFFERS,
 	CHRONO_ADMIN_SET_WRITE_CHUNK,
+	CHRONO_ADMIN_SET_WIRE_HAS_SEQ,
 };
 
 struct chrono_admin_request {
@@ -65,6 +66,7 @@ struct chrono_admin_request {
 	bool req_include_deleted;      /* SEGMENTS_LIST */
 	uint32_t req_write_buf_count;  /* SET_WRITE_BUFFERS */
 	uint32_t req_write_chunk_bytes; /* SET_WRITE_CHUNK */
+	bool req_wire_has_seq;          /* SET_WIRE_HAS_SEQ */
 
 	/* response */
 	int rc; /* 0 = success, negative errno-style on failure */
@@ -127,6 +129,18 @@ void daemon_quick_format_start(struct app_context_t *ctx);
  * -EINVAL if the requested value is out of range. */
 void daemon_set_write_buf_count(struct app_context_t *ctx, uint32_t count);
 void daemon_set_write_chunk_bytes(struct app_context_t *ctx, uint32_t bytes);
+
+/* Same synchronous shape as the two setters above (no bdev I/O, validates
+ * then calls chrono_admin_fulfill() itself) - a plain bool, so no range to
+ * validate. -EBUSY if ctx->recording/claim_in_progress, same reasoning as
+ * the write-path knobs: capture_poll() reads ctx->wire_has_seq once per
+ * packet, so it must stay fixed for a whole segment's duration or a single
+ * recording could end up parsed two different ways. This is a testing/
+ * diagnostic knob, not a wire-format negotiation - real production traffic
+ * never carries dpdk-app-example's synthetic 8-byte sequence prefix, so a
+ * real deployment just leaves this on --no-wire-seq (or its web equivalent)
+ * permanently. */
+void daemon_set_wire_has_seq(struct app_context_t *ctx, bool wire_has_seq);
 
 /* Called by whichever handler (in chrono_admin.c or main.c) finished
  * req's work, successfully or not. Locks, records rc, marks done, and
