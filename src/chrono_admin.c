@@ -479,7 +479,49 @@ admin_do_recording_stop(struct app_context_t *ctx, struct chrono_admin_request *
 		chrono_admin_fulfill(req, -EALREADY);
 		return;
 	}
+	atomic_store_explicit(&ctx->last_stop_reason, CHRONO_STOP_USER, memory_order_relaxed);
 	daemon_stop_recording(ctx);
+}
+
+/* ---- QUICK_FORMAT: delegate to main.c's daemon_quick_format_start(),
+ * which mirrors --init --force's own TOC-zero-then-header-write chain and
+ * calls chrono_admin_fulfill() itself at its terminal step, same as
+ * RECORDING_START/STOP above. ---- */
+
+static void
+admin_do_quick_format(struct app_context_t *ctx, struct chrono_admin_request *req)
+{
+	if (atomic_load(&ctx->recording)) {
+		chrono_admin_fulfill(req, -EBUSY);
+		return;
+	}
+	daemon_quick_format_start(ctx);
+}
+
+/* ---- SET_WRITE_BUFFERS / SET_WRITE_CHUNK: both synchronous, delegate
+ * straight to main.c's setters, which call chrono_admin_fulfill()
+ * themselves - see chrono_admin.h. Refused while recording (same as
+ * QUICK_FORMAT above) since every buffer must be guaranteed idle for either
+ * change to be safe - see MAX_WRITE_BUFFERS's comment in chrono_ctx.h. ---- */
+
+static void
+admin_do_write_buffers(struct app_context_t *ctx, struct chrono_admin_request *req)
+{
+	if (atomic_load(&ctx->recording)) {
+		chrono_admin_fulfill(req, -EBUSY);
+		return;
+	}
+	daemon_set_write_buf_count(ctx, req->req_write_buf_count);
+}
+
+static void
+admin_do_write_chunk(struct app_context_t *ctx, struct chrono_admin_request *req)
+{
+	if (atomic_load(&ctx->recording)) {
+		chrono_admin_fulfill(req, -EBUSY);
+		return;
+	}
+	daemon_set_write_chunk_bytes(ctx, req->req_write_chunk_bytes);
 }
 
 void
@@ -508,6 +550,15 @@ chrono_admin_dispatch(void *arg)
 		break;
 	case CHRONO_ADMIN_SEGMENT_DELETE:
 		admin_do_segment_delete(ctx, req);
+		break;
+	case CHRONO_ADMIN_QUICK_FORMAT:
+		admin_do_quick_format(ctx, req);
+		break;
+	case CHRONO_ADMIN_SET_WRITE_BUFFERS:
+		admin_do_write_buffers(ctx, req);
+		break;
+	case CHRONO_ADMIN_SET_WRITE_CHUNK:
+		admin_do_write_chunk(ctx, req);
 		break;
 	default:
 		chrono_admin_fulfill(req, -EINVAL);

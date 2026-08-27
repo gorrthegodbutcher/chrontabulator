@@ -27,6 +27,19 @@
 #define REQUEST_BUF_SIZE 512
 #define ACCEPT_POLL_TIMEOUT_MS 1000
 #define ADMIN_TIMEOUT_SEC 3
+/* QUICK_FORMAT does real bulk I/O (zeroing the whole fixed-size
+ * CHRONO_TOC_SLOT_COUNT TOC region, then a header write) rather than the
+ * single-block writes every other admin op does - 3s proved too short in
+ * practice (observed a format completing in tens of seconds on this drive)
+ * and a timed-out chrono_admin_call() leaves req->busy stuck true until the
+ * still-in-flight op actually finishes server-side, so every other admin
+ * request (including a subsequent recording start) fails fast with -EBUSY
+ * for however much longer that takes - reads to the user as "the page
+ * froze, then wouldn't record." A generous timeout here doesn't fully close
+ * that gap (a request that never completes at all would still wedge busy
+ * forever - true of every admin op, not just this one), but it comfortably
+ * covers the slow-but-finite duration actually observed. */
+#define ADMIN_QUICK_FORMAT_TIMEOUT_SEC 30
 
 struct web_server_ctx {
 	int listen_fd;
@@ -154,6 +167,23 @@ query_get_uint(const char *rest, const char *key, uint64_t *out)
  * lock-free atomic, a DPDK call already proven safe from any thread
  * (port_init.c), or a value set once before this thread was created (see
  * the comment on app_context_t's start_time field in chrono_ctx.h). */
+/* Mirrors enum chrono_stop_reason (chrono_ctx.h) - kept as a separate
+ * switch rather than an array indexed by the enum so a reordered enum
+ * fails loudly (missing case, compiler warning) instead of silently
+ * mislabeling a reason. */
+static const char *
+stop_reason_str(uint32_t reason)
+{
+	switch ((enum chrono_stop_reason)reason) {
+	case CHRONO_STOP_NONE: return "none";
+	case CHRONO_STOP_USER: return "user";
+	case CHRONO_STOP_COUNT_LIMIT: return "count_limit";
+	case CHRONO_STOP_DISK_FULL: return "disk_full";
+	case CHRONO_STOP_WRITE_FAILURES: return "write_failures";
+	}
+	return "unknown";
+}
+
 static void
 render_status_json(struct app_context_t *ctx, char *out, size_t out_size)
 {
@@ -172,6 +202,8 @@ render_status_json(struct app_context_t *ctx, char *out, size_t out_size)
 							    memory_order_relaxed);
 	uint64_t write_errors = atomic_load_explicit(&ctx->write_errors_total,
 						       memory_order_relaxed);
+	const char *stop_reason = stop_reason_str(
+		atomic_load_explicit(&ctx->last_stop_reason, memory_order_relaxed));
 
 	struct rte_eth_stats hw;
 	struct rte_eth_link link;
@@ -208,6 +240,7 @@ render_status_json(struct app_context_t *ctx, char *out, size_t out_size)
 		"  \"current_segment_record_count\": %" PRIu64 ",\n"
 		"  \"current_segment_dropped_count\": %" PRIu64 ",\n"
 		"  \"current_segment_elapsed_sec\": %.3f,\n"
+		"  \"last_stop_reason\": \"%s\",\n"
 		"  \"udp_port\": %u,\n"
 		"  \"link_up\": %s,\n"
 		"  \"link_speed_mbps\": %u,\n"
@@ -226,11 +259,22 @@ render_status_json(struct app_context_t *ctx, char *out, size_t out_size)
 		"  \"data_free_bytes\": %" PRIu64 ",\n"
 		"  \"bytes_written_total\": %" PRIu64 ",\n"
 		"  \"writes_completed_total\": %" PRIu64 ",\n"
-		"  \"write_errors_total\": %" PRIu64 "\n"
+		"  \"write_errors_total\": %" PRIu64 ",\n"
+		"  \"write_buf_count\": %u,\n"
+		"  \"max_write_buffers\": %d,\n"
+		"  \"write_chunk_bytes\": %u,\n"
+		"  \"max_write_chunk_bytes\": %d,\n"
+		"  \"startup_mtu\": %u,\n"
+		"  \"startup_force_10g\": %s,\n"
+		"  \"startup_udp_port\": %u,\n"
+		"  \"startup_count_limit\": %" PRIu64 ",\n"
+		"  \"startup_write_buf_count\": %u,\n"
+		"  \"startup_write_chunk_bytes\": %u\n"
 		"}\n",
 		(long)(time(NULL) - ctx->start_time),
 		recording ? "true" : "false", seg_id_json,
 		rec_count, drop_count, elapsed_sec,
+		stop_reason,
 		ctx->opts.udp_port,
 		(have_link && link.link_status) ? "true" : "false",
 		have_link ? link.link_speed : 0,
@@ -241,7 +285,12 @@ render_status_json(struct app_context_t *ctx, char *out, size_t out_size)
 		ctx->block_size, total_bytes,
 		ctx->vol.toc_slot_count, next_seg, toc_pct,
 		data_used_bytes, data_free_bytes,
-		bytes_written, writes_completed, write_errors);
+		bytes_written, writes_completed, write_errors,
+		ctx->write_buf_count, MAX_WRITE_BUFFERS,
+		ctx->buf_size, MAX_WRITE_CHUNK_BYTES,
+		ctx->opts.mtu, ctx->opts.force_10g ? "true" : "false",
+		ctx->opts.udp_port, ctx->opts.count_limit,
+		ctx->opts.write_buf_count, ctx->opts.write_chunk_bytes);
 }
 
 /* EAL/DPDK-level diagnostics, separate from the app-level counters in
@@ -374,6 +423,30 @@ handle_connection(int fd, struct app_context_t *ctx)
 		   strncmp(rest, "/delete", strlen("/delete")) == 0) {
 		req->op = CHRONO_ADMIN_SEGMENT_DELETE;
 		req->req_segment_id = seg_id;
+		rc = chrono_admin_call(ctx, req, ADMIN_TIMEOUT_SEC);
+		send_admin_result(fd, rc == 0 ? req->rc : rc, req);
+	} else if (strncmp(request_line, "POST /quick-format", strlen("POST /quick-format")) == 0) {
+		/* Destructive and irreversible (segment metadata, not the
+		 * underlying data bytes - see the QUICK_FORMAT comment in
+		 * main.c) - require an explicit confirm=1 on top of whatever
+		 * confirmation the UI itself shows, so this can never be
+		 * triggered by an accidental or malformed request. */
+		if (!query_get_uint(request_line, "confirm", &v) || v != 1) {
+			send_response(fd, "400 Bad Request", "application/json",
+				      "{\"error\":\"pass confirm=1 to format\"}\n");
+		} else {
+			req->op = CHRONO_ADMIN_QUICK_FORMAT;
+			rc = chrono_admin_call(ctx, req, ADMIN_QUICK_FORMAT_TIMEOUT_SEC);
+			send_admin_result(fd, rc == 0 ? req->rc : rc, req);
+		}
+	} else if (strncmp(request_line, "POST /write-buffers", strlen("POST /write-buffers")) == 0) {
+		req->op = CHRONO_ADMIN_SET_WRITE_BUFFERS;
+		req->req_write_buf_count = query_get_uint(request_line, "count", &v) ? (uint32_t)v : 0;
+		rc = chrono_admin_call(ctx, req, ADMIN_TIMEOUT_SEC);
+		send_admin_result(fd, rc == 0 ? req->rc : rc, req);
+	} else if (strncmp(request_line, "POST /write-chunk", strlen("POST /write-chunk")) == 0) {
+		req->op = CHRONO_ADMIN_SET_WRITE_CHUNK;
+		req->req_write_chunk_bytes = query_get_uint(request_line, "bytes", &v) ? (uint32_t)v : 0;
 		rc = chrono_admin_call(ctx, req, ADMIN_TIMEOUT_SEC);
 		send_admin_result(fd, rc == 0 ? req->rc : rc, req);
 	} else {

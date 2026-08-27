@@ -36,6 +36,9 @@ enum chrono_admin_op {
 	CHRONO_ADMIN_SEGMENTS_LIST,
 	CHRONO_ADMIN_SEGMENT_RECORDS,
 	CHRONO_ADMIN_SEGMENT_DELETE,
+	CHRONO_ADMIN_QUICK_FORMAT,
+	CHRONO_ADMIN_SET_WRITE_BUFFERS,
+	CHRONO_ADMIN_SET_WRITE_CHUNK,
 };
 
 struct chrono_admin_request {
@@ -60,6 +63,8 @@ struct chrono_admin_request {
 	uint64_t req_offset;           /* SEGMENT_RECORDS */
 	uint32_t req_limit;            /* SEGMENT_RECORDS, clamped server-side */
 	bool req_include_deleted;      /* SEGMENTS_LIST */
+	uint32_t req_write_buf_count;  /* SET_WRITE_BUFFERS */
+	uint32_t req_write_chunk_bytes; /* SET_WRITE_CHUNK */
 
 	/* response */
 	int rc; /* 0 = success, negative errno-style on failure */
@@ -101,6 +106,27 @@ void chrono_admin_dispatch(void *arg);
  * request is ever in flight. */
 void daemon_claim_segment_start(struct app_context_t *ctx);
 void daemon_stop_recording(struct app_context_t *ctx);
+
+/* Same "called by chrono_admin.c, fulfills ctx->admin_req itself at its
+ * terminal step" shape as the two above. Wipes the TOC and writes a fresh
+ * volume header - the web-triggered equivalent of CLI `--init --force`.
+ * Named "quick format" (not "erase") because it only resets metadata: the
+ * actual segment data blocks are never zeroed, just orphaned - a real
+ * full-disk zero-write is a distinct, much slower operation, not this one.
+ * Caller (admin_do_quick_format() in chrono_admin.c) is responsible for
+ * refusing this while ctx->recording is true; this function assumes that's
+ * already been checked. */
+void daemon_quick_format_start(struct app_context_t *ctx);
+
+/* Synchronous setters (no bdev I/O, so no async chain like the ops above -
+ * each just validates, sets the field, and calls chrono_admin_fulfill()
+ * itself before returning) for the two live-tunable write-path knobs - see
+ * MAX_WRITE_BUFFERS's comment in chrono_ctx.h. Both return their result via
+ * ctx->admin_req.rc, same as every other op; -EBUSY if ctx->recording (set
+ * by admin_do_write_buffers()/admin_do_write_chunk() in chrono_admin.c),
+ * -EINVAL if the requested value is out of range. */
+void daemon_set_write_buf_count(struct app_context_t *ctx, uint32_t count);
+void daemon_set_write_chunk_bytes(struct app_context_t *ctx, uint32_t bytes);
 
 /* Called by whichever handler (in chrono_admin.c or main.c) finished
  * req's work, successfully or not. Locks, records rc, marks done, and

@@ -44,10 +44,21 @@
 #define MBUF_DATA_SIZE   9216
 #define BURST_SIZE       32
 #define VOLUME_HEADER_BLOCK 0
-#define WRITE_CHUNK_TARGET (64 * 1024) /* rounded up to the device's own
-					 * write granularity below - not a
-					 * hard size, just comfortably bigger
-					 * than one jumbo (~9KB) record */
+/* Consecutive spdk_bdev_write() failures (submission or completion) before
+ * giving up and stopping recording, rather than retrying forever at full
+ * speed. Low on purpose: a real transient hiccup (the only kind worth
+ * retrying through) resolves in 1-2 attempts; every case observed in
+ * practice so far is a hard, permanent rejection (e.g. EINVAL) that will
+ * never succeed no matter how many times it's retried, so waiting longer
+ * just burns CPU that capture_poll() needs for RX - the actual cause of
+ * the packet-drop cascade this is meant to prevent. */
+#define CHRONO_WRITE_FAILURE_THRESHOLD 5
+#define WRITE_CHUNK_TARGET (64 * 1024) /* default --write-chunk-kb, rounded
+					 * up to the device's own write
+					 * granularity below - not a hard
+					 * size, just comfortably bigger than
+					 * one jumbo (~9KB) record */
+#define DEFAULT_WRITE_BUFFERS 8 /* default --write-buffers */
 
 /* SPDK's own app framework reserves long-option values 256-274 or so for
  * its own flags (see lib/event/app.c's *_OPT_IDX defines, e.g.
@@ -62,13 +73,17 @@ enum {
 	CHRONO_OPT_FORCE,
 	CHRONO_OPT_SERVE,
 	CHRONO_OPT_WEB_PORT,
+	CHRONO_OPT_WRITE_BUFFERS,
+	CHRONO_OPT_WRITE_CHUNK_KB,
 };
 
 static const struct option chrono_long_opts[] = {
-	{"init",     no_argument,       NULL, CHRONO_OPT_INIT},
-	{"force",    no_argument,       NULL, CHRONO_OPT_FORCE},
-	{"serve",    no_argument,       NULL, CHRONO_OPT_SERVE},
-	{"web-port", required_argument, NULL, CHRONO_OPT_WEB_PORT},
+	{"init",           no_argument,       NULL, CHRONO_OPT_INIT},
+	{"force",          no_argument,       NULL, CHRONO_OPT_FORCE},
+	{"serve",          no_argument,       NULL, CHRONO_OPT_SERVE},
+	{"web-port",       required_argument, NULL, CHRONO_OPT_WEB_PORT},
+	{"write-buffers",  required_argument, NULL, CHRONO_OPT_WRITE_BUFFERS},
+	{"write-chunk-kb", required_argument, NULL, CHRONO_OPT_WRITE_CHUNK_KB},
 	{NULL, 0, NULL, 0},
 };
 
@@ -96,6 +111,13 @@ app_usage(void)
 	printf("                           requirement; brings up the NIC once and lets\n");
 	printf("                           recording be started/stopped repeatedly\n");
 	printf(" --web-port=<port>         daemon's embedded web UI port (default 8080, 0 = headless)\n");
+	printf(" --write-buffers=<N>       starting number of write buffers, 1-%d (default %d) -\n",
+	       MAX_WRITE_BUFFERS, DEFAULT_WRITE_BUFFERS);
+	printf("                           live-tunable from the web UI while not recording\n");
+	printf(" --write-chunk-kb=<N>      starting write chunk size in KB, %d-%d (default %d) -\n",
+	       MIN_WRITE_CHUNK_BYTES / 1024, MAX_WRITE_CHUNK_BYTES / 1024,
+	       WRITE_CHUNK_TARGET / 1024);
+	printf("                           live-tunable from the web UI while not recording\n");
 }
 
 static int
@@ -143,6 +165,25 @@ app_parse_arg(int ch, char *arg)
 	case CHRONO_OPT_WEB_PORT:
 		g_ctx.opts.web_port = (uint16_t)strtoul(arg, NULL, 10);
 		break;
+	case CHRONO_OPT_WRITE_BUFFERS: {
+		unsigned long n = strtoul(arg, NULL, 10);
+		if (n < 1 || n > MAX_WRITE_BUFFERS) {
+			fprintf(stderr, "--write-buffers must be 1-%d\n", MAX_WRITE_BUFFERS);
+			return -EINVAL;
+		}
+		g_ctx.opts.write_buf_count = (uint32_t)n;
+		break;
+	}
+	case CHRONO_OPT_WRITE_CHUNK_KB: {
+		unsigned long kb = strtoul(arg, NULL, 10);
+		if (kb * 1024 < MIN_WRITE_CHUNK_BYTES || kb * 1024 > MAX_WRITE_CHUNK_BYTES) {
+			fprintf(stderr, "--write-chunk-kb must be %d-%d\n",
+				MIN_WRITE_CHUNK_BYTES / 1024, MAX_WRITE_CHUNK_BYTES / 1024);
+			return -EINVAL;
+		}
+		g_ctx.opts.write_chunk_bytes = (uint32_t)(kb * 1024);
+		break;
+	}
 	default:
 		return -EINVAL;
 	}
@@ -161,6 +202,56 @@ volume_header_is_valid(const struct chrono_volume_header *hdr)
 	return hdr->magic == CHRONO_VOLUME_MAGIC && hdr->version == CHRONO_FORMAT_VERSION;
 }
 
+/* Shared by app_started()'s startup computation and the live
+ * CHRONO_ADMIN_SET_WRITE_CHUNK handler - clamps to [MIN_WRITE_CHUNK_BYTES,
+ * MAX_WRITE_CHUNK_BYTES] first (a request outside that range is rejected by
+ * the caller before this ever runs, but clamping here too is cheap
+ * insurance) then rounds up to a multiple of the device's write_unit_bytes,
+ * same as the original WRITE_CHUNK_TARGET rounding - a jumbo record alone
+ * can be ~9KB, which wouldn't fit in a single 512-byte write_unit. */
+static uint32_t
+chrono_round_write_chunk(struct app_context_t *ctx, uint32_t requested)
+{
+	if (requested < MIN_WRITE_CHUNK_BYTES)
+		requested = MIN_WRITE_CHUNK_BYTES;
+	if (requested > MAX_WRITE_CHUNK_BYTES)
+		requested = MAX_WRITE_CHUNK_BYTES;
+	return ((requested + ctx->write_unit_bytes - 1) / ctx->write_unit_bytes) *
+	       ctx->write_unit_bytes;
+}
+
+/* Stops and closes the DPDK port, if chrono_port_init() ever actually
+ * brought one up (guarded by ctx->nic_up - see chrono_ctx.h). Leaving the
+ * port running when the process exits has been a real source of flaky
+ * link renegotiation on the next run - same rationale, and the same
+ * stop/close/settle sequence, as dpdk-app-example's main.c. Safe to call
+ * more than once (fail_started()/cleanup_and_stop() are both reachable
+ * from several points and neither is mutually exclusive with the other in
+ * a way that guarantees single-call); nic_up is cleared immediately so a
+ * second call is a no-op. */
+static void
+chrono_port_teardown(struct app_context_t *ctx)
+{
+	if (!ctx->nic_up)
+		return;
+	ctx->nic_up = false;
+
+	int stop_ret = rte_eth_dev_stop(ctx->port);
+	if (stop_ret != 0)
+		SPDK_ERRLOG("rte_eth_dev_stop failed: %s\n", rte_strerror(-stop_ret));
+
+	int close_ret = rte_eth_dev_close(ctx->port);
+	if (close_ret != 0)
+		SPDK_ERRLOG("rte_eth_dev_close failed: %s\n", rte_strerror(-close_ret));
+
+	/* IEEE 802.3 autonegotiation is a physical-layer state machine with
+	 * its own settling time - closing the port doesn't make that
+	 * instantaneous, and rapidly cycling close-then-reopen has been
+	 * observed elsewhere in this pair of projects to leave a link unable
+	 * to pass traffic even though both sides report it UP. */
+	rte_delay_us(3000000);
+}
+
 /* Releases whatever app_started() had already allocated before hitting a
  * fatal setup error (in any of the three modes - capture, dump/list,
  * init), then stops the app with a nonzero exit code. spdk_app_stop()
@@ -168,13 +259,14 @@ volume_header_is_valid(const struct chrono_volume_header *hdr)
  * outstanding bdev descriptors and I/O channels to close, so calling it
  * while ctx->bdev_desc/bdev_io_channel are still open leaves the reactor
  * running indefinitely instead of exiting. Safe to call at any point -
- * every field it touches is NULL/zero until actually allocated (g_ctx is
- * memset at startup), and buffers[] is only ever populated well into the
- * capture path, never in dump/list/init. */
+ * every field it touches is NULL/zero (or, for nic_up, false) until
+ * actually allocated/set (g_ctx is memset at startup), and buffers[] is
+ * only ever populated well into the capture path, never in dump/list/init. */
 static void
 fail_started(struct app_context_t *ctx)
 {
-	for (int i = 0; i < NUM_WRITE_BUFFERS; i++) {
+	chrono_port_teardown(ctx);
+	for (int i = 0; i < MAX_WRITE_BUFFERS; i++) {
 		if (ctx->buffers[i].data)
 			spdk_dma_free(ctx->buffers[i].data);
 	}
@@ -199,6 +291,7 @@ fail_started(struct app_context_t *ctx)
 static void
 cleanup_and_stop(struct app_context_t *ctx, int rc)
 {
+	chrono_port_teardown(ctx);
 	if (ctx->vol_buf)
 		spdk_dma_free(ctx->vol_buf);
 	if (ctx->io_buf)
@@ -319,6 +412,36 @@ finalize_current_stop(struct app_context_t *ctx)
 		finalize_segment_and_stop(ctx);
 }
 
+/* Called from both write_complete()'s completion-failure path and
+ * retry_flush()'s submission-failure path - either one means the device
+ * just refused a write. CHRONO_WRITE_FAILURE_THRESHOLD consecutive
+ * failures (reset by any success - see write_complete()) stops recording
+ * instead of retrying forever: observed in practice, every failure so far
+ * has been a hard, permanent rejection (spdk_bdev_write() returning EINVAL
+ * on every subsequent attempt, not a transient I/O error), so retrying
+ * indefinitely just burns the reactor thread's time re-submitting doomed
+ * writes instead of servicing RX - which is what actually produced the
+ * cascade of dropped packets that made a broken write path look like a
+ * capture-side problem. Safe to call when already stopping (mid-finalize-
+ * flush racing the same failure) - daemon_stop_recording()/begin_shutdown()
+ * both no-op if ctx->stopping is already true. */
+static void
+chrono_note_write_failure(struct app_context_t *ctx)
+{
+	ctx->consecutive_write_failures++;
+	if (ctx->consecutive_write_failures < CHRONO_WRITE_FAILURE_THRESHOLD)
+		return;
+
+	SPDK_ERRLOG("%u consecutive write failures - device is not accepting writes,"
+		    " stopping recording\n", ctx->consecutive_write_failures);
+	atomic_store_explicit(&ctx->last_stop_reason, CHRONO_STOP_WRITE_FAILURES,
+			       memory_order_relaxed);
+	if (ctx->opts.serve_mode)
+		daemon_stop_recording(ctx);
+	else
+		begin_shutdown(ctx);
+}
+
 static void
 write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
@@ -332,10 +455,12 @@ write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	if (!success) {
 		SPDK_ERRLOG("bdev write error\n");
 		atomic_fetch_add_explicit(&ctx->write_errors_total, 1, memory_order_relaxed);
+		chrono_note_write_failure(ctx);
 	} else {
 		atomic_fetch_add_explicit(&ctx->bytes_written_total, ctx->buf_size,
 					   memory_order_relaxed);
 		atomic_fetch_add_explicit(&ctx->writes_completed_total, 1, memory_order_relaxed);
+		ctx->consecutive_write_failures = 0;
 	}
 
 	ctx->pending_writes--;
@@ -365,6 +490,7 @@ retry_flush(void *arg)
 		wb->in_flight = false;
 		wb->used = 0;
 		ctx->pending_writes--;
+		chrono_note_write_failure(ctx);
 		if (ctx->stopping && ctx->pending_writes == 0)
 			finalize_current_stop(ctx);
 	}
@@ -382,9 +508,28 @@ flush_buffer(struct app_context_t *ctx, int idx)
 	if (wb->used == 0)
 		return;
 
+	if (ctx->next_write_block + ctx->buf_size_blocks > ctx->cached_num_blocks) {
+		/* Device is already full. capture_poll() checks this same
+		 * condition before ever calling us for a just-filled buffer
+		 * (see there for why: write_complete() has no way to tell
+		 * "device full" apart from a transient error, so nothing
+		 * downstream of that check would ever stop capture on its
+		 * own), so the only way to land here is begin_shutdown()'s/
+		 * daemon_stop_recording()'s own final flush of the
+		 * currently-accumulating buffer racing the same condition.
+		 * Drop it rather than issue a write that's guaranteed to
+		 * fail. */
+		SPDK_ERRLOG("dropping final %u-byte buffer: no room left on device"
+			    " (block %" PRIu64 " + %u > %" PRIu64 ")\n",
+			    wb->used, ctx->next_write_block, ctx->buf_size_blocks,
+			    ctx->cached_num_blocks);
+		wb->used = 0;
+		return;
+	}
+
 	/* spdk_dma_zmalloc() only zeroes a buffer once, at allocation. Each
-	 * of the NUM_WRITE_BUFFERS slots gets reused many times over a long
-	 * capture, and a later, smaller fill would otherwise leave stale
+	 * of the active write_buf_count slots gets reused many times over a
+	 * long capture, and a later, smaller fill would otherwise leave stale
 	 * record bytes from a previous, larger fill sitting past the new
 	 * `used` boundary - a reader relying on magic==0 to mean "no more
 	 * records here" would misparse that leftover as real data. */
@@ -456,9 +601,33 @@ capture_poll(void *arg)
 		if (wb->used + rec_size > ctx->buf_size) {
 			/* Doesn't fit in what's left of this buffer - flush
 			 * it (flush_buffer() pads the remainder with zeros)
-			 * and move to the next buffer round-robin. */
+			 * and move to the next buffer round-robin. Bail out
+			 * first if that flush would run the volume off the
+			 * physical end of the device: write_complete() has no
+			 * way to distinguish "device full" from a transient
+			 * error, so without this check nothing would ever stop
+			 * capture on its own - every future write would just
+			 * keep failing forever (this is what produced the
+			 * "wrote for a while, then a flood of write errors"
+			 * symptom before this check existed). */
+			if (ctx->next_write_block + ctx->buf_size_blocks > ctx->cached_num_blocks) {
+				SPDK_ERRLOG("device full at block %" PRIu64 "/%" PRIu64
+					    " - stopping recording\n",
+					    ctx->next_write_block, ctx->cached_num_blocks);
+				atomic_store_explicit(&ctx->last_stop_reason, CHRONO_STOP_DISK_FULL,
+						       memory_order_relaxed);
+				atomic_fetch_add_explicit(&ctx->dropped_count, 1,
+							   memory_order_relaxed);
+				rte_pktmbuf_free(bufs[i]);
+				if (ctx->opts.serve_mode)
+					daemon_stop_recording(ctx);
+				else
+					begin_shutdown(ctx);
+				break;
+			}
+
 			flush_buffer(ctx, ctx->cur_buf);
-			ctx->cur_buf = (ctx->cur_buf + 1) % NUM_WRITE_BUFFERS;
+			ctx->cur_buf = (ctx->cur_buf + 1) % ctx->write_buf_count;
 			wb = &ctx->buffers[ctx->cur_buf];
 
 			if (wb->in_flight || rec_size > ctx->buf_size) {
@@ -495,6 +664,8 @@ capture_poll(void *arg)
 		rte_pktmbuf_free(bufs[i]);
 
 		if (ctx->opts.count_limit != 0 && new_count >= ctx->opts.count_limit) {
+			atomic_store_explicit(&ctx->last_stop_reason, CHRONO_STOP_COUNT_LIMIT,
+					       memory_order_relaxed);
 			if (ctx->opts.serve_mode)
 				daemon_stop_recording(ctx);
 			else
@@ -561,8 +732,11 @@ claim_header_write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb
 	ctx->next_write_block = ctx->segment_start_block;
 
 	uint32_t buf_align = spdk_bdev_get_buf_align(ctx->bdev);
-	for (int i = 0; i < NUM_WRITE_BUFFERS; i++) {
-		ctx->buffers[i].data = spdk_dma_zmalloc(ctx->buf_size, buf_align, NULL);
+	/* Every slot allocated at MAX_WRITE_CHUNK_BYTES up front, regardless
+	 * of the active ctx->buf_size - see MAX_WRITE_BUFFERS's comment in
+	 * chrono_ctx.h for why. */
+	for (int i = 0; i < MAX_WRITE_BUFFERS; i++) {
+		ctx->buffers[i].data = spdk_dma_zmalloc(MAX_WRITE_CHUNK_BYTES, buf_align, NULL);
 		if (!ctx->buffers[i].data) {
 			SPDK_ERRLOG("Failed to allocate write buffer %d\n", i);
 			fail_started(ctx);
@@ -570,9 +744,9 @@ claim_header_write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb
 		}
 	}
 
-	SPDK_NOTICELOG("bdev block_size=%u write_unit=%u buf_size=%u (%d buffers)\n",
+	SPDK_NOTICELOG("bdev block_size=%u write_unit=%u buf_size=%u (%u/%d buffers active)\n",
 		       ctx->block_size, spdk_bdev_get_write_unit_size(ctx->bdev),
-		       ctx->buf_size, NUM_WRITE_BUFFERS);
+		       ctx->buf_size, ctx->write_buf_count, MAX_WRITE_BUFFERS);
 
 	if (rte_eth_dev_count_avail() != 1) {
 		SPDK_ERRLOG("Expected exactly 1 available DPDK port, found %u\n",
@@ -600,6 +774,7 @@ claim_header_write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb
 		fail_started(ctx);
 		return;
 	}
+	ctx->nic_up = true;
 	rte_ether_addr_copy(&mac_addr, &ctx->local_mac);
 
 	SPDK_NOTICELOG("Recording UDP port %u to bdev %s, segment %u, port %u ready\n",
@@ -1276,7 +1451,11 @@ daemon_claim_header_write_complete(struct spdk_bdev_io *bdev_io, bool success, v
 
 	ctx->next_write_block = ctx->segment_start_block;
 	ctx->cur_buf = 0;
-	for (int i = 0; i < NUM_WRITE_BUFFERS; i++) {
+	/* All MAX_WRITE_BUFFERS slots, not just the active write_buf_count -
+	 * a slot that was active in some earlier segment (before write_buf_count
+	 * was lowered) must not carry stale used/in_flight state into a much
+	 * later segment where it's raised again. */
+	for (int i = 0; i < MAX_WRITE_BUFFERS; i++) {
 		ctx->buffers[i].used = 0;
 		ctx->buffers[i].in_flight = false;
 	}
@@ -1284,6 +1463,8 @@ daemon_claim_header_write_complete(struct spdk_bdev_io *bdev_io, bool success, v
 	atomic_store_explicit(&ctx->dropped_count, 0, memory_order_relaxed);
 	atomic_store_explicit(&ctx->first_capture_tsc, 0, memory_order_relaxed);
 	atomic_store_explicit(&ctx->last_capture_tsc, 0, memory_order_relaxed);
+	atomic_store_explicit(&ctx->last_stop_reason, CHRONO_STOP_NONE, memory_order_relaxed);
+	ctx->consecutive_write_failures = 0;
 	ctx->stopping = false;
 
 	atomic_store_explicit(&ctx->current_segment_id, ctx->segment_id, memory_order_relaxed);
@@ -1368,6 +1549,189 @@ daemon_claim_segment_start(struct app_context_t *ctx)
 	}
 }
 
+/* ---- QUICK_FORMAT: web-triggered equivalent of CLI `--init --force` ----
+ *
+ * Mirrors init_zero_toc_chunk()/init_zero_toc_chunk_write_complete()/
+ * init_write_header()/init_write_header_complete()'s shape exactly (same
+ * zero-the-TOC-then-write-a-fresh-header sequence, fixed CHRONO_TOC_SLOT_COUNT
+ * layout, same "a write failure here is just reported, not retried"
+ * simplification - see init_zero_toc_chunk_write_complete()'s comment for
+ * why that's fine for a rare, explicit, one-shot operation), but duplicated
+ * rather than shared: every CLI path ends in fail_started()/
+ * cleanup_and_stop(), which would tear down the whole daemon over a single
+ * write hiccup. Builds the fresh header into ctx->qf_staged_vol rather
+ * than ctx->vol directly, so a failure partway through never leaves the
+ * live volume header (still backing reads/status while this runs) in a
+ * half-formatted state - see chrono_ctx.h's comment on qf_staged_vol.
+ * Idempotent on retry after a failure: it always re-derives the same fixed
+ * layout from scratch. admin_do_quick_format() (chrono_admin.c) has
+ * already refused this while ctx->recording is true.
+ *
+ * Named "quick" because it only resets the TOC/header (a fixed, small
+ * amount of data - CHRONO_TOC_SLOT_COUNT blocks) - the actual segment data
+ * blocks are never zeroed, just orphaned. A real full-disk zero-write is a
+ * distinct, much slower operation this doesn't attempt. */
+
+static void
+daemon_quick_format_write_header_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct app_context_t *ctx = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		SPDK_ERRLOG("failed to write the formatted volume header\n");
+		chrono_admin_fulfill(&ctx->admin_req, -EIO);
+		return;
+	}
+
+	ctx->vol = ctx->qf_staged_vol;
+	ctx->next_write_block = ctx->vol.data_start_block;
+	atomic_store_explicit(&ctx->record_count, 0, memory_order_relaxed);
+	atomic_store_explicit(&ctx->dropped_count, 0, memory_order_relaxed);
+	atomic_store_explicit(&ctx->first_capture_tsc, 0, memory_order_relaxed);
+	atomic_store_explicit(&ctx->last_capture_tsc, 0, memory_order_relaxed);
+	atomic_store_explicit(&ctx->mirror_next_segment_id, ctx->vol.next_segment_id,
+			       memory_order_relaxed);
+	atomic_store_explicit(&ctx->mirror_next_data_block, ctx->vol.next_data_block,
+			       memory_order_relaxed);
+
+	SPDK_NOTICELOG("Quick-formatted chrontabulator volume on %s: %u segment slots reserved,"
+		       " data starts at block %" PRIu64 "\n",
+		       ctx->opts.bdev_name, ctx->vol.toc_slot_count, ctx->vol.data_start_block);
+	chrono_admin_fulfill(&ctx->admin_req, 0);
+}
+
+static void
+daemon_quick_format_write_header(struct app_context_t *ctx)
+{
+	int rc;
+
+	memset(ctx->vol_buf, 0, ctx->block_size);
+	*(struct chrono_volume_header *)ctx->vol_buf = ctx->qf_staged_vol;
+
+	rc = spdk_bdev_write(ctx->bdev_desc, ctx->bdev_io_channel, ctx->vol_buf,
+			      VOLUME_HEADER_BLOCK * ctx->block_size, ctx->block_size,
+			      daemon_quick_format_write_header_complete, ctx);
+	if (rc != 0) {
+		SPDK_ERRLOG("%s writing the formatted volume header\n", spdk_strerror(-rc));
+		chrono_admin_fulfill(&ctx->admin_req, rc);
+	}
+}
+
+static void
+daemon_quick_format_zero_toc_chunk(struct app_context_t *ctx);
+
+static void
+daemon_quick_format_zero_toc_chunk_write_complete(struct spdk_bdev_io *bdev_io, bool success,
+						   void *cb_arg)
+{
+	struct app_context_t *ctx = cb_arg;
+	uint64_t blocks_left, chunk_blocks;
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		SPDK_ERRLOG("failed zeroing the TOC region at block %" PRIu64 "\n",
+			    ctx->init_cur_block);
+		chrono_admin_fulfill(&ctx->admin_req, -EIO);
+		return;
+	}
+
+	blocks_left = ctx->qf_staged_vol.data_start_block - ctx->init_cur_block;
+	chunk_blocks = blocks_left < ctx->buf_size_blocks ? blocks_left : ctx->buf_size_blocks;
+	ctx->init_cur_block += chunk_blocks;
+
+	daemon_quick_format_zero_toc_chunk(ctx);
+}
+
+static void
+daemon_quick_format_zero_toc_chunk(struct app_context_t *ctx)
+{
+	uint64_t blocks_left, chunk_blocks;
+	uint32_t chunk_bytes;
+	int rc;
+
+	if (ctx->init_cur_block >= ctx->qf_staged_vol.data_start_block) {
+		daemon_quick_format_write_header(ctx);
+		return;
+	}
+
+	blocks_left = ctx->qf_staged_vol.data_start_block - ctx->init_cur_block;
+	chunk_blocks = blocks_left < ctx->buf_size_blocks ? blocks_left : ctx->buf_size_blocks;
+	chunk_bytes = (uint32_t)(chunk_blocks * ctx->block_size);
+
+	/* Unlike the CLI init path's io_buf (freshly spdk_dma_zmalloc()'d and
+	 * never written to before init runs), the daemon's ctx->io_buf is
+	 * shared with SEGMENTS_LIST/SEGMENT_RECORDS reads and claim/finalize's
+	 * TOC entry writes - it can hold anything by the time a format runs,
+	 * so it has to be zeroed explicitly before reuse as a zero-fill
+	 * source. */
+	memset(ctx->io_buf, 0, chunk_bytes);
+	rc = spdk_bdev_write(ctx->bdev_desc, ctx->bdev_io_channel, ctx->io_buf,
+			      ctx->init_cur_block * ctx->block_size, chunk_bytes,
+			      daemon_quick_format_zero_toc_chunk_write_complete, ctx);
+	if (rc != 0) {
+		SPDK_ERRLOG("%s zeroing the TOC region at block %" PRIu64 "\n",
+			    spdk_strerror(-rc), ctx->init_cur_block);
+		chrono_admin_fulfill(&ctx->admin_req, rc);
+	}
+}
+
+void
+daemon_quick_format_start(struct app_context_t *ctx)
+{
+	struct timespec ts;
+
+	SPDK_NOTICELOG("Quick-formatting chrontabulator volume on %s...\n", ctx->opts.bdev_name);
+
+	memset(&ctx->qf_staged_vol, 0, sizeof(ctx->qf_staged_vol));
+	ctx->qf_staged_vol.magic = CHRONO_VOLUME_MAGIC;
+	ctx->qf_staged_vol.version = CHRONO_FORMAT_VERSION;
+	ctx->qf_staged_vol.block_size = ctx->block_size;
+	ctx->qf_staged_vol.toc_slot_count = CHRONO_TOC_SLOT_COUNT;
+	ctx->qf_staged_vol.next_segment_id = 0;
+	ctx->qf_staged_vol.toc_start_block = VOLUME_HEADER_BLOCK + 1;
+	ctx->qf_staged_vol.data_start_block = ctx->qf_staged_vol.toc_start_block +
+					       CHRONO_TOC_SLOT_COUNT;
+	ctx->qf_staged_vol.next_data_block = ctx->qf_staged_vol.data_start_block;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	ctx->qf_staged_vol.init_wall_clock_sec = (uint64_t)ts.tv_sec;
+
+	ctx->init_cur_block = ctx->qf_staged_vol.toc_start_block;
+	daemon_quick_format_zero_toc_chunk(ctx);
+}
+
+/* ---- SET_WRITE_BUFFERS / SET_WRITE_CHUNK: live tuning, see
+ * MAX_WRITE_BUFFERS's comment in chrono_ctx.h. Both synchronous - every
+ * buffer is already allocated at MAX_WRITE_CHUNK_BYTES, so there's no bdev
+ * I/O or DMA (re)allocation here, just a validated field write.
+ * admin_do_write_buffers()/admin_do_write_chunk() (chrono_admin.c) have
+ * already refused these while ctx->recording is true. */
+
+void
+daemon_set_write_buf_count(struct app_context_t *ctx, uint32_t count)
+{
+	if (count < 1 || count > MAX_WRITE_BUFFERS) {
+		chrono_admin_fulfill(&ctx->admin_req, -EINVAL);
+		return;
+	}
+	ctx->write_buf_count = count;
+	SPDK_NOTICELOG("write_buf_count set to %u\n", count);
+	chrono_admin_fulfill(&ctx->admin_req, 0);
+}
+
+void
+daemon_set_write_chunk_bytes(struct app_context_t *ctx, uint32_t bytes)
+{
+	if (bytes < MIN_WRITE_CHUNK_BYTES || bytes > MAX_WRITE_CHUNK_BYTES) {
+		chrono_admin_fulfill(&ctx->admin_req, -EINVAL);
+		return;
+	}
+	ctx->buf_size = chrono_round_write_chunk(ctx, bytes);
+	ctx->buf_size_blocks = ctx->buf_size / ctx->block_size;
+	SPDK_NOTICELOG("write chunk size set to %u bytes\n", ctx->buf_size);
+	chrono_admin_fulfill(&ctx->admin_req, 0);
+}
+
 /* Sets shutting_down (and, transitively via the web thread's own poll of
  * it, the web server's quit flag) as the very first action, before any
  * bdev/segment teardown - see the shutdown-safety design in the
@@ -1416,6 +1780,7 @@ daemon_bring_up_nic(struct app_context_t *ctx)
 		fail_started(ctx);
 		return -1;
 	}
+	ctx->nic_up = true;
 	rte_ether_addr_copy(&mac_addr, &ctx->local_mac);
 
 	/* Registered once, here, and left running for the daemon's whole
@@ -1440,8 +1805,11 @@ static void
 daemon_finish_startup(struct app_context_t *ctx)
 {
 	uint32_t buf_align = spdk_bdev_get_buf_align(ctx->bdev);
-	for (int i = 0; i < NUM_WRITE_BUFFERS; i++) {
-		ctx->buffers[i].data = spdk_dma_zmalloc(ctx->buf_size, buf_align, NULL);
+	/* Every slot allocated at MAX_WRITE_CHUNK_BYTES up front, regardless
+	 * of the active ctx->buf_size - see MAX_WRITE_BUFFERS's comment in
+	 * chrono_ctx.h for why. */
+	for (int i = 0; i < MAX_WRITE_BUFFERS; i++) {
+		ctx->buffers[i].data = spdk_dma_zmalloc(MAX_WRITE_CHUNK_BYTES, buf_align, NULL);
 		if (!ctx->buffers[i].data) {
 			SPDK_ERRLOG("Failed to allocate write buffer %d\n", i);
 			fail_started(ctx);
@@ -1594,14 +1962,9 @@ app_started(void *arg1)
 	}
 
 	ctx->block_size = spdk_bdev_get_block_size(ctx->bdev);
-	/* write_unit_size is the device's minimum atomic write granularity
-	 * (typically 1 block), not a size to build the whole write buffer
-	 * out of - a jumbo record alone can be ~9KB, which wouldn't fit in
-	 * a 512-byte buffer. Round WRITE_CHUNK_TARGET up to a clean
-	 * multiple of that granularity instead. */
-	uint32_t write_unit_bytes = ctx->block_size * spdk_bdev_get_write_unit_size(ctx->bdev);
-	ctx->buf_size = ((WRITE_CHUNK_TARGET + write_unit_bytes - 1) / write_unit_bytes) *
-			write_unit_bytes;
+	ctx->write_unit_bytes = ctx->block_size * spdk_bdev_get_write_unit_size(ctx->bdev);
+	ctx->write_buf_count = ctx->opts.write_buf_count;
+	ctx->buf_size = chrono_round_write_chunk(ctx, ctx->opts.write_chunk_bytes);
 	ctx->buf_size_blocks = ctx->buf_size / ctx->block_size;
 
 	buf_align = spdk_bdev_get_buf_align(ctx->bdev);
@@ -1645,6 +2008,8 @@ main(int argc, char **argv)
 	memset(&g_ctx, 0, sizeof(g_ctx));
 	g_ctx.opts.web_port = 8080; /* --web-port=0 (explicitly passed) is what
 				     * means headless - see app_parse_arg(). */
+	g_ctx.opts.write_buf_count = DEFAULT_WRITE_BUFFERS;
+	g_ctx.opts.write_chunk_bytes = WRITE_CHUNK_TARGET;
 
 	spdk_app_opts_init(&opts, sizeof(opts));
 	opts.name = "chrontabulator";
