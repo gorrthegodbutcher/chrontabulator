@@ -625,6 +625,15 @@ admin_do_wire_has_seq(struct app_context_t *ctx, struct chrono_admin_request *re
 	daemon_set_wire_has_seq(ctx, req->req_wire_has_seq);
 }
 
+/* ---- SET_LOCAL_IP: same synchronous shape, no guard - see
+ * daemon_set_local_ip()'s comment (chrono_admin.h) for why. ---- */
+
+static void
+admin_do_set_local_ip(struct app_context_t *ctx, struct chrono_admin_request *req)
+{
+	daemon_set_local_ip(ctx, req->req_local_ip, req->req_have_local_ip);
+}
+
 void
 chrono_admin_dispatch(void *arg)
 {
@@ -663,6 +672,9 @@ chrono_admin_dispatch(void *arg)
 		break;
 	case CHRONO_ADMIN_SET_WIRE_HAS_SEQ:
 		admin_do_wire_has_seq(ctx, req);
+		break;
+	case CHRONO_ADMIN_SET_LOCAL_IP:
+		admin_do_set_local_ip(ctx, req);
 		break;
 	default:
 		chrono_admin_fulfill(req, -EINVAL);

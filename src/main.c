@@ -1914,6 +1914,20 @@ daemon_set_wire_has_seq(struct app_context_t *ctx, bool wire_has_seq)
 	chrono_admin_fulfill(&ctx->admin_req, 0);
 }
 
+void
+daemon_set_local_ip(struct app_context_t *ctx, const uint8_t ip[4], bool have_ip)
+{
+	if (have_ip) {
+		memcpy(ctx->opts.local_ip, ip, 4);
+		ctx->opts.have_local_ip = true;
+		SPDK_NOTICELOG("local_ip set to %u.%u.%u.%u\n", ip[0], ip[1], ip[2], ip[3]);
+	} else {
+		ctx->opts.have_local_ip = false;
+		SPDK_NOTICELOG("local_ip cleared - no longer answering ARP/ICMP-echo\n");
+	}
+	chrono_admin_fulfill(&ctx->admin_req, 0);
+}
+
 /* Sets shutting_down (and, transitively via the web thread's own poll of
  * it, the web server's quit flag) as the very first action, before any
  * bdev/segment teardown - see the shutdown-safety design in the

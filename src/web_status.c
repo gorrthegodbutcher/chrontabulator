@@ -2,6 +2,7 @@
 #include "web_status.h"
 #include "chrono_admin.h"
 #include "chrono_web_html.h"
+#include "common.h"
 
 #include <rte_ethdev.h>
 #include <rte_cycles.h>
@@ -163,6 +164,43 @@ query_get_uint(const char *rest, const char *key, uint64_t *out)
 	return false;
 }
 
+/* Same shape as query_get_uint() above, for a value that isn't a plain
+ * non-negative integer (an IPv4 dotted-quad here) - same "not a general-
+ * purpose parser" scope, no urlencoding support needed. Returns false (out
+ * left untouched beyond a leading NUL) if the key isn't present; a present
+ * but empty value ("ip=") returns true with out[0] == '\0', letting the
+ * caller distinguish "not given" from "given empty" if it needs to. */
+static bool
+query_get_str(const char *rest, const char *key, char *out, size_t out_size)
+{
+	const char *q = strchr(rest, '?');
+	size_t key_len = strlen(key);
+
+	out[0] = '\0';
+	if (!q)
+		return false;
+	q++;
+	while (*q && *q != ' ') {
+		if (strncmp(q, key, key_len) == 0 && q[key_len] == '=') {
+			const char *val_start = q + key_len + 1;
+			const char *val_end = val_start;
+			while (*val_end && *val_end != '&' && *val_end != ' ')
+				val_end++;
+			size_t len = (size_t)(val_end - val_start);
+			if (len >= out_size)
+				len = out_size - 1;
+			memcpy(out, val_start, len);
+			out[len] = '\0';
+			return true;
+		}
+		const char *amp = strchr(q, '&');
+		if (!amp)
+			break;
+		q = amp + 1;
+	}
+	return false;
+}
+
 /* Tier 1: served directly, no bridge - every field here is either a
  * lock-free atomic, a DPDK call already proven safe from any thread
  * (port_init.c), or a value set once before this thread was created (see
@@ -242,6 +280,8 @@ render_status_json(struct app_context_t *ctx, char *out, size_t out_size)
 		"  \"current_segment_elapsed_sec\": %.3f,\n"
 		"  \"last_stop_reason\": \"%s\",\n"
 		"  \"udp_port\": %u,\n"
+		"  \"have_local_ip\": %s,\n"
+		"  \"local_ip\": \"%u.%u.%u.%u\",\n"
 		"  \"link_up\": %s,\n"
 		"  \"link_speed_mbps\": %u,\n"
 		"  \"have_hw_stats\": %s,\n"
@@ -278,6 +318,9 @@ render_status_json(struct app_context_t *ctx, char *out, size_t out_size)
 		rec_count, drop_count, elapsed_sec,
 		stop_reason,
 		ctx->opts.udp_port,
+		ctx->opts.have_local_ip ? "true" : "false",
+		ctx->opts.local_ip[0], ctx->opts.local_ip[1],
+		ctx->opts.local_ip[2], ctx->opts.local_ip[3],
 		(have_link && link.link_status) ? "true" : "false",
 		have_link ? link.link_speed : 0,
 		have_hw ? "true" : "false",
@@ -458,6 +501,25 @@ handle_connection(int fd, struct app_context_t *ctx)
 		req->req_wire_has_seq = query_get_uint(request_line, "value", &v) ? v != 0 : true;
 		rc = chrono_admin_call(ctx, req, ADMIN_TIMEOUT_SEC);
 		send_admin_result(fd, rc == 0 ? req->rc : rc, req);
+	} else if (strncmp(request_line, "POST /local-ip", strlen("POST /local-ip")) == 0) {
+		char ip_str[32];
+
+		query_get_str(request_line, "ip", ip_str, sizeof(ip_str));
+		req->op = CHRONO_ADMIN_SET_LOCAL_IP;
+		if (ip_str[0] == '\0') {
+			/* Empty value = stop answering ARP/ICMP-echo, same as
+			 * never passing -I at all. */
+			req->req_have_local_ip = false;
+			rc = chrono_admin_call(ctx, req, ADMIN_TIMEOUT_SEC);
+			send_admin_result(fd, rc == 0 ? req->rc : rc, req);
+		} else if (app_parse_ipv4(ip_str, req->req_local_ip) != 0) {
+			send_response(fd, "400 Bad Request", "application/json",
+				      "{\"error\":\"invalid IP address\"}\n");
+		} else {
+			req->req_have_local_ip = true;
+			rc = chrono_admin_call(ctx, req, ADMIN_TIMEOUT_SEC);
+			send_admin_result(fd, rc == 0 ? req->rc : rc, req);
+		}
 	} else {
 		send_response(fd, "404 Not Found", "text/plain", "not found\n");
 	}

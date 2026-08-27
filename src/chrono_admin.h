@@ -40,6 +40,7 @@ enum chrono_admin_op {
 	CHRONO_ADMIN_SET_WRITE_BUFFERS,
 	CHRONO_ADMIN_SET_WRITE_CHUNK,
 	CHRONO_ADMIN_SET_WIRE_HAS_SEQ,
+	CHRONO_ADMIN_SET_LOCAL_IP,
 };
 
 struct chrono_admin_request {
@@ -67,6 +68,11 @@ struct chrono_admin_request {
 	uint32_t req_write_buf_count;  /* SET_WRITE_BUFFERS */
 	uint32_t req_write_chunk_bytes; /* SET_WRITE_CHUNK */
 	bool req_wire_has_seq;          /* SET_WIRE_HAS_SEQ */
+	uint8_t req_local_ip[4];        /* SET_LOCAL_IP, meaningful only if
+					  * req_have_local_ip */
+	bool req_have_local_ip;         /* SET_LOCAL_IP - false means "stop
+					  * answering ARP/ICMP-echo entirely",
+					  * same as never passing -I at all */
 
 	/* response */
 	int rc; /* 0 = success, negative errno-style on failure */
@@ -141,6 +147,15 @@ void daemon_set_write_chunk_bytes(struct app_context_t *ctx, uint32_t bytes);
  * real deployment just leaves this on --no-wire-seq (or its web equivalent)
  * permanently. */
 void daemon_set_wire_has_seq(struct app_context_t *ctx, bool wire_has_seq);
+
+/* Same synchronous shape as the setters above, but with no -EBUSY guard at
+ * all - unlike wire_has_seq/the write-path knobs, net_responder.c reads
+ * ctx->opts.local_ip/have_local_ip fresh on every packet with no per-
+ * segment consistency requirement (ARP/ICMP-echo replies are independent
+ * of whatever's being recorded, if anything), so this is safe to change
+ * at any time, recording or not - same shape as dpdk-app-example's
+ * interactive sender's own freely-live-tunable fields. Always succeeds. */
+void daemon_set_local_ip(struct app_context_t *ctx, const uint8_t ip[4], bool have_ip);
 
 /* Called by whichever handler (in chrono_admin.c or main.c) finished
  * req's work, successfully or not. Locks, records rc, marks done, and
