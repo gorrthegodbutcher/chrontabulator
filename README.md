@@ -74,6 +74,51 @@ first place. This project can't take that shortcut since it needs SPDK's
 bdev machinery, so it resolves the underlying conflict at the source
 instead: one external DPDK build, everything link-time static.)
 
+## NIC support - trying a different vendor
+
+Unlike `dpdk-app-example` (which loads any PMD as a runtime plugin, no
+rebuild needed - see its own README), this project **statically links
+one specific PMD archive into its own binary** (`src/Makefile`'s
+`-Wl,--whole-archive -l:librte_net_atlantic.a -Wl,--no-whole-archive`) -
+see "Why a separate DPDK build, and why static linking" above for why
+runtime `-d` plugin loading isn't an option here (it panics against
+SPDK's own statically-embedded `rte_bus_pci`). Practically, that means
+switching NIC vendors is a two-step change, not just a different `-A`:
+
+1. **Host-level bind** - identical to any other NIC: `vfio-pci`, same
+   `unbind`/`driver_override`/`drivers_probe` procedure
+   `dpdk-app-example`'s README documents.
+2. **Repoint the static link** - edit `src/Makefile`'s
+   `-l:librte_net_atlantic.a` to the new vendor's archive (e.g.
+   `-l:librte_net_ixgbe.a` for an Intel 82599/X520, `-l:librte_net_i40e.a`
+   for X710/XL710, `-l:librte_net_bnxt.a` for Broadcom), then rebuild.
+   The archive has to actually exist in the separate full-driver DPDK
+   build this project links against (`/usr/local/lib/x86_64-linux-gnu/
+   librte_net_*.a` inside the dev container - `ls` it for the current,
+   exact list; 124 present at last count, covering Intel `ixgbe`/`i40e`/
+   `iavf`/`ice`/`idpf`/`e1000`/`fm10k`/`cpfl`, Broadcom `bnxt`, Cisco
+   `enic`, Chelsio `cxgbe`, AMD/Solarflare `sfc`, Amazon `ena`, Google
+   `gve`, Realtek `r8169`, Huawei `hns3`, NXP `dpaa`/`dpaa2`, and more).
+   Once that archive is linked in, `-A <new-pci-addr>` at runtime works
+   exactly like it does today - DPDK still auto-detects the PMD to hand
+   the device to via PCI vendor/device ID, same mechanism as always, just
+   choosing from a one-driver set instead of every plugin in a directory.
+
+**Mellanox/NVIDIA (mlx4/mlx5) is the one vendor that doesn't fit this
+pattern at all**, static or dynamic - it's not in the archive list above,
+and it never will be via this same mechanism even if added: mlx5 talks
+to the NIC through the kernel's `mlx5_core` driver plus userspace
+`libmlx5`/`libibverbs`, not `vfio-pci`, so it needs `rdma-core` enabled
+as a DPDK build dependency and a different host-side setup entirely, not
+just a new `-l:` line.
+
+**Multiple NICs at once** (e.g. a NIC purely for `chrontabulator`'s own
+ARP/ICMP responder while capturing from an atlantic card) would need
+both archives linked in together - untested, but should work the same
+way SPDK itself links in several bdev module archives at once; DPDK's
+PCI-ID-based device-to-driver matching doesn't care how many drivers are
+in the binary as long as each is unambiguous for its own hardware.
+
 ## Usage
 
 A device must be formatted once before its first capture:
