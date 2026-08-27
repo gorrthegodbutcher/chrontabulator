@@ -37,6 +37,7 @@
 #include "chrono_ctx.h"
 #include "chrono_admin.h"
 #include "web_status.h"
+#include "net_responder.h"
 
 #define NUM_MBUFS        8191
 #define MBUF_CACHE_SIZE  250
@@ -83,6 +84,7 @@ app_usage(void)
 	printf(" -b <bdev>                 name of the bdev to record to (required)\n");
 	printf(" -P <port>                 UDP destination port to capture (required unless -D or --init)\n");
 	printf(" -M <mtu>                  set the NIC's MTU (0 = device default)\n");
+	printf(" -I <ip>                   answer ARP/ping for this IP (omit = don't respond at all)\n");
 	printf(" -F                        restrict advertised link speed to 10G only\n");
 	printf(" -C <count>                stop after this many records (0 = unlimited)\n");
 	printf(" -D                        list segments on the bdev instead of capturing\n");
@@ -108,6 +110,13 @@ app_parse_arg(int ch, char *arg)
 		break;
 	case 'M':
 		g_ctx.opts.mtu = (uint16_t)strtoul(arg, NULL, 10);
+		break;
+	case 'I':
+		if (app_parse_ipv4(arg, g_ctx.opts.local_ip) != 0) {
+			fprintf(stderr, "Invalid -I address: %s\n", arg);
+			return -EINVAL;
+		}
+		g_ctx.opts.have_local_ip = true;
 		break;
 	case 'F':
 		g_ctx.opts.force_10g = true;
@@ -396,9 +405,6 @@ capture_poll(void *arg)
 	uint16_t nb_rx;
 	int did_work = SPDK_POLLER_IDLE;
 
-	if (ctx->stopping)
-		return SPDK_POLLER_IDLE;
-
 	nb_rx = rte_eth_rx_burst(ctx->port, 0, bufs, BURST_SIZE);
 	if (nb_rx == 0)
 		return SPDK_POLLER_IDLE;
@@ -407,6 +413,25 @@ capture_poll(void *arg)
 
 	for (uint16_t i = 0; i < nb_rx; i++) {
 		did_work = SPDK_POLLER_BUSY;
+
+		if (net_responder_try_handle(ctx, bufs[i]))
+			continue; /* ARP/ICMP-echo reply sent (or dropped) -
+				   * mbuf ownership already given up */
+
+		/* Daemon mode only (this poller now runs continuously - see
+		 * daemon_bring_up_nic() - rather than only while a
+		 * segment is claimed): nothing to record into while idle or
+		 * mid-finalize, and ctx->buffers[]/ctx->cur_buf may be
+		 * actively being flushed/reset by the finalize chain right
+		 * now - just drop and move on. CLI mode never sets
+		 * serve_mode, so this is a no-op there; its poller is
+		 * unregistered synchronously before finalize begins (see
+		 * begin_shutdown()), so it can never observe this state. */
+		if (ctx->opts.serve_mode &&
+		    (ctx->stopping || !atomic_load_explicit(&ctx->recording, memory_order_relaxed))) {
+			rte_pktmbuf_free(bufs[i]);
+			continue;
+		}
 
 		uint8_t *data = rte_pktmbuf_mtod(bufs[i], uint8_t *);
 		uint32_t len = rte_pktmbuf_pkt_len(bufs[i]);
@@ -575,6 +600,7 @@ claim_header_write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb
 		fail_started(ctx);
 		return;
 	}
+	rte_ether_addr_copy(&mac_addr, &ctx->local_mac);
 
 	SPDK_NOTICELOG("Recording UDP port %u to bdev %s, segment %u, port %u ready\n",
 		       ctx->opts.udp_port, ctx->opts.bdev_name, ctx->segment_id, ctx->port);
@@ -1112,6 +1138,7 @@ init_start(struct app_context_t *ctx)
 static void
 daemon_teardown_and_exit(struct app_context_t *ctx)
 {
+	spdk_poller_unregister(&ctx->rx_poller);
 	cleanup_and_stop(ctx, 0);
 }
 
@@ -1219,7 +1246,9 @@ daemon_stop_recording(struct app_context_t *ctx)
 		return;
 	ctx->stopping = true;
 
-	spdk_poller_unregister(&ctx->rx_poller);
+	/* rx_poller stays registered - it keeps answering ARP/ping while
+	 * idle (see daemon_bring_up_nic()); only the NVMe-write half
+	 * of capture_poll() needs to stop, gated there on ctx->recording. */
 	flush_buffer(ctx, ctx->cur_buf);
 
 	if (ctx->pending_writes == 0)
@@ -1260,7 +1289,8 @@ daemon_claim_header_write_complete(struct spdk_bdev_io *bdev_io, bool success, v
 	atomic_store_explicit(&ctx->current_segment_id, ctx->segment_id, memory_order_relaxed);
 	atomic_store_explicit(&ctx->recording, true, memory_order_relaxed);
 
-	ctx->rx_poller = spdk_poller_register(capture_poll, ctx, 0);
+	/* rx_poller is already running (registered once at daemon startup -
+	 * see daemon_bring_up_nic()); nothing to do here. */
 
 	SPDK_NOTICELOG("Recording UDP port %u to bdev %s, segment %u\n",
 		       ctx->opts.udp_port, ctx->opts.bdev_name, ctx->segment_id);
@@ -1355,14 +1385,16 @@ daemon_shutdown_cb(void)
 		daemon_teardown_and_exit(ctx);
 }
 
-static void
-daemon_bring_up_networking(struct app_context_t *ctx)
+/* Returns 0 on success, -1 on failure (fail_started() already called and
+ * the whole process already tearing down - caller must not proceed). */
+static int
+daemon_bring_up_nic(struct app_context_t *ctx)
 {
 	if (rte_eth_dev_count_avail() != 1) {
 		SPDK_ERRLOG("Expected exactly 1 available DPDK port, found %u\n",
 			    rte_eth_dev_count_avail());
 		fail_started(ctx);
-		return;
+		return -1;
 	}
 	RTE_ETH_FOREACH_DEV(ctx->port)
 		break;
@@ -1373,7 +1405,7 @@ daemon_bring_up_networking(struct app_context_t *ctx)
 	if (ctx->mbuf_pool == NULL) {
 		SPDK_ERRLOG("Cannot create mbuf pool: %s\n", rte_strerror(rte_errno));
 		fail_started(ctx);
-		return;
+		return -1;
 	}
 
 	struct rte_ether_addr mac_addr;
@@ -1382,9 +1414,31 @@ daemon_bring_up_networking(struct app_context_t *ctx)
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to initialize port %u\n", ctx->port);
 		fail_started(ctx);
-		return;
+		return -1;
 	}
+	rte_ether_addr_copy(&mac_addr, &ctx->local_mac);
 
+	/* Registered once, here, and left running for the daemon's whole
+	 * life (never unregistered on recording stop/start - only at actual
+	 * daemon teardown) - net_responder_try_handle() needs this poller
+	 * alive to answer ARP/ping even while idle, not just mid-recording.
+	 * capture_poll() itself gates the NVMe-write half of its work behind
+	 * ctx->recording; the responder half always runs. */
+	ctx->rx_poller = spdk_poller_register(capture_poll, ctx, 0);
+	return 0;
+}
+
+/* Everything here (unlike daemon_bring_up_nic() above) genuinely needs
+ * ctx->vol already populated - the mirror atomics and the log line read
+ * it directly, and web_status_start() hands ctx to a new pthread that
+ * reads ctx->vol.data_start_block/toc_slot_count without any lock
+ * ("write-before-thread-creation" - see chrono_ctx.h's start_time comment).
+ * That safety property only holds if every plain-field write to ctx->vol
+ * happens before this call - so this must stay sequenced after the volume
+ * header read completes, even though NIC bring-up itself no longer is. */
+static void
+daemon_finish_startup(struct app_context_t *ctx)
+{
 	uint32_t buf_align = spdk_bdev_get_buf_align(ctx->bdev);
 	for (int i = 0; i < NUM_WRITE_BUFFERS; i++) {
 		ctx->buffers[i].data = spdk_dma_zmalloc(ctx->buf_size, buf_align, NULL);
@@ -1457,13 +1511,29 @@ daemon_volume_header_read_complete(struct spdk_bdev_io *bdev_io, bool success, v
 		return;
 	}
 
-	daemon_bring_up_networking(ctx);
+	daemon_finish_startup(ctx);
 }
 
 static void
 daemon_start(struct app_context_t *ctx)
 {
 	int rc;
+
+	/* NIC bring-up runs first, directly here - not chained behind the
+	 * volume header read's completion callback below. Two reasons: (1)
+	 * it has no actual dependency on the volume header's contents, so
+	 * ARP/ping/the web UI shouldn't be held hostage by an unrelated disk
+	 * read (or fail outright if that read fails - see daemon_finish_startup()'s
+	 * comment for what DOES still need to wait); (2) it rules out any
+	 * possibility that calling rte_eth_dev_start() et al. from inside an
+	 * SPDK bdev-completion callback, rather than a plain top-level call,
+	 * matters for this PMD's own interrupt-thread setup - unlikely, since
+	 * both run on the same reactor OS thread either way, but this PMD has
+	 * shown real interrupt-thread fragility elsewhere this project (see
+	 * the atlantic segfault findings in project memory), so it costs
+	 * nothing to remove the variable rather than argue it away. */
+	if (daemon_bring_up_nic(ctx) != 0)
+		return;
 
 	rc = spdk_bdev_read(ctx->bdev_desc, ctx->bdev_io_channel, ctx->vol_buf,
 			     VOLUME_HEADER_BLOCK * ctx->block_size, ctx->block_size,
@@ -1579,7 +1649,7 @@ main(int argc, char **argv)
 	spdk_app_opts_init(&opts, sizeof(opts));
 	opts.name = "chrontabulator";
 
-	rc = spdk_app_parse_args(argc, argv, &opts, "b:P:M:FC:DS:", chrono_long_opts,
+	rc = spdk_app_parse_args(argc, argv, &opts, "b:P:M:I:FC:DS:", chrono_long_opts,
 				  app_parse_arg, app_usage);
 	if (rc != SPDK_APP_PARSE_ARGS_SUCCESS)
 		exit(rc);

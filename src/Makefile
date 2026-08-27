@@ -4,7 +4,7 @@ include $(SPDK_ROOT_DIR)/mk/spdk.modules.mk
 
 APP = chrontabulator
 
-C_SRCS := main.c common.c port_init.c web_status.c chrono_admin.c
+C_SRCS := main.c common.c port_init.c web_status.c chrono_admin.c net_responder.c
 
 SPDK_LIB_LIST = $(ALL_MODULES_LIST) event event_bdev
 

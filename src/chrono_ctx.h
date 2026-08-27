@@ -11,6 +11,7 @@
 #include "spdk/thread.h"
 
 #include <rte_mempool.h>
+#include <rte_ether.h>
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -35,6 +36,14 @@ struct app_opts_t {
 	uint32_t dump_segment_id;
 	bool serve_mode;
 	uint16_t web_port; /* 0 = daemon runs headless, no web server */
+
+	/* -I <ip>: the address net_responder.c answers ARP/ICMP-echo for.
+	 * Optional - if never given, have_local_ip stays false and
+	 * net_responder_try_handle() never matches anything, so behavior is
+	 * identical to before this feature existed. Network byte order, 4
+	 * bytes, same convention as app_parse_ipv4()'s other callers. */
+	uint8_t local_ip[4];
+	bool have_local_ip;
 };
 
 struct write_buf {
@@ -73,6 +82,11 @@ struct app_context_t {
 			      * registered it as an EAL thread. Same
 			      * write-before-thread-creation safety as
 			      * mbuf_pool itself. */
+	struct rte_ether_addr local_mac; /* this port's own MAC, captured
+					   * once from chrono_port_init()'s
+					   * mac_addr_out - net_responder.c
+					   * needs it to fill in ARP replies
+					   * and the reflected Ethernet src. */
 	struct spdk_poller *rx_poller;
 
 	/* Single writer (capture_poll, on the reactor thread) in both CLI

@@ -5,6 +5,11 @@
 #include "port_init.h"
 
 #define RX_RING_SIZE 1024
+#define TX_RING_SIZE 512 /* atlantic PMD's minimum (rejects anything below
+			   * 512, confirmed live: "atl_tx_queue_setup(): ...
+			   * greater than or equal to 512") - only ever
+			   * carries ARP/ICMP-echo replies (net_responder.c)
+			   * anyway, nowhere near RX's volume */
 
 int
 chrono_port_init(uint16_t port, struct rte_mempool *mbuf_pool, uint16_t mtu,
@@ -12,6 +17,7 @@ chrono_port_init(uint16_t port, struct rte_mempool *mbuf_pool, uint16_t mtu,
 {
 	struct rte_eth_conf port_conf;
 	uint16_t nb_rxd = RX_RING_SIZE;
+	uint16_t nb_txd = TX_RING_SIZE;
 	int retval;
 	struct rte_eth_dev_info dev_info;
 
@@ -41,16 +47,20 @@ chrono_port_init(uint16_t port, struct rte_mempool *mbuf_pool, uint16_t mtu,
 			port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_SCATTER;
 	}
 
-	retval = rte_eth_dev_configure(port, 1, 0, &port_conf);
+	retval = rte_eth_dev_configure(port, 1, 1, &port_conf);
 	if (retval != 0)
 		return retval;
 
-	retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, NULL);
+	retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, &nb_txd);
 	if (retval != 0)
 		return retval;
 
 	retval = rte_eth_rx_queue_setup(port, 0, nb_rxd, rte_eth_dev_socket_id(port),
 					 NULL, mbuf_pool);
+	if (retval < 0)
+		return retval;
+
+	retval = rte_eth_tx_queue_setup(port, 0, nb_txd, rte_eth_dev_socket_id(port), NULL);
 	if (retval < 0)
 		return retval;
 
