@@ -61,6 +61,31 @@ admin_buf_appendf(struct chrono_admin_request *req, const char *fmt, ...)
 		req->resp_len += (size_t)n < remaining ? (size_t)n : remaining;
 }
 
+/* Hex-encodes raw bytes directly into resp_buf - admin_buf_appendf()'s
+ * printf-based approach can't safely carry arbitrary binary (not
+ * null-terminated, may contain embedded NULs). Truncates rather than
+ * overflowing resp_buf if there's not enough room, same fail-safe
+ * philosophy as admin_buf_appendf() silently no-op'ing once resp_buf_cap
+ * is reached. */
+static void
+admin_buf_append_hex(struct chrono_admin_request *req, const uint8_t *data, uint32_t len)
+{
+	static const char hexdigits[] = "0123456789abcdef";
+
+	if (req->resp_len >= req->resp_buf_cap)
+		return;
+	size_t remaining = req->resp_buf_cap - req->resp_len;
+	if ((size_t)len * 2 > remaining)
+		len = (uint32_t)(remaining / 2);
+
+	char *out = req->resp_buf + req->resp_len;
+	for (uint32_t i = 0; i < len; i++) {
+		out[i * 2] = hexdigits[data[i] >> 4];
+		out[i * 2 + 1] = hexdigits[data[i] & 0xF];
+	}
+	req->resp_len += (size_t)len * 2;
+}
+
 int
 chrono_admin_init(struct app_context_t *ctx)
 {
@@ -252,6 +277,8 @@ admin_records_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, vo
 
 	spdk_bdev_free_io(bdev_io);
 	if (!success) {
+		SPDK_ERRLOG("segment %u records read failed at block %" PRIu64 "\n",
+			    ctx->segment_id, ctx->dump_cur_block);
 		chrono_admin_fulfill(req, -EIO);
 		return;
 	}
@@ -262,13 +289,29 @@ admin_records_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, vo
 		struct chrono_record_hdr *hdr = (struct chrono_record_hdr *)(ctx->io_buf + off);
 
 		if (hdr->magic != CHRONO_RECORD_MAGIC) {
-			/* Padding reached before the TOC entry's own record
-			 * count was satisfied - treat what we've already
-			 * collected as the true end. */
-			ctx->dump_records_seen = ctx->dump_target_count;
+			/* Padding at the tail of THIS chunk - same as the
+			 * CLI's dump_chunk_read_complete() - just stop
+			 * parsing it and let admin_records_read_next_chunk()
+			 * below decide whether to advance to the next one.
+			 * NOT the end of the whole segment: every chunk
+			 * boundary looks like this whenever the write chunk
+			 * size isn't an exact multiple of the record size,
+			 * not just the segment's actual last chunk - this
+			 * used to unconditionally treat any padding as "done"
+			 * (ctx->dump_records_seen = ctx->dump_target_count),
+			 * which silently returned empty/incomplete results
+			 * for any offset past the first chunk's worth of
+			 * records - never noticed until payloads large enough
+			 * to fit only a few dozen records per chunk made it
+			 * trivial to hit on offset 40+. */
 			break;
 		}
 		if (off + sizeof(*hdr) + hdr->len > ctx->dump_write_chunk_bytes) {
+			SPDK_ERRLOG("segment %u: record at chunk block %" PRIu64 " off %u claims"
+				    " len %u, overruns chunk_bytes=%u (dump_records_seen=%"
+				    PRIu64 ")\n",
+				    ctx->segment_id, ctx->dump_cur_block, off, hdr->len,
+				    ctx->dump_write_chunk_bytes, ctx->dump_records_seen);
 			chrono_admin_fulfill(req, -EIO);
 			return;
 		}
@@ -281,13 +324,37 @@ admin_records_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, vo
 
 			admin_buf_appendf(req,
 				"%s{\"seq\":%" PRIu64 ",\"capture_tsc\":%" PRIu64
-				",\"rel_sec\":%.6f,\"len\":%u}",
+				",\"rel_sec\":%.6f,\"len\":%u",
 				first ? "" : ",", hdr->seq, hdr->capture_tsc, rel_sec, hdr->len);
+			/* Only for a single-record fetch (req_limit == 1) - a
+			 * bulk listing hex-encoding every record's payload
+			 * could easily exceed resp_buf_cap (1MB) well before
+			 * CHRONO_RECORDS_LIMIT_MAX records are collected. */
+			if (req->req_limit == 1) {
+				admin_buf_appendf(req, ",\"payload_hex\":\"");
+				admin_buf_append_hex(req, (const uint8_t *)hdr + sizeof(*hdr),
+						      hdr->len);
+				admin_buf_appendf(req, "\"");
+			}
+			admin_buf_appendf(req, "}");
 			req->scan_collected++;
 		}
 
 		off += (uint32_t)sizeof(*hdr) + hdr->len;
 		ctx->dump_records_seen++;
+	}
+
+	/* Mirrors the CLI's dump_chunk_read_complete() offset==0 check: hit
+	 * padding immediately, at the very start of a fresh chunk, before
+	 * the TOC entry's own record count was satisfied - genuinely out of
+	 * real data on disk, not just this chunk's own tail padding. */
+	if (off == 0 && ctx->dump_records_seen < ctx->dump_target_count &&
+	    req->scan_collected < req->req_limit) {
+		SPDK_ERRLOG("segment %u: expected %" PRIu64 " records, only found %" PRIu64
+			    " before hitting unwritten space\n",
+			    ctx->segment_id, ctx->dump_target_count, ctx->dump_records_seen);
+		chrono_admin_fulfill(req, -EIO);
+		return;
 	}
 
 	admin_records_read_next_chunk(ctx);
@@ -315,6 +382,10 @@ admin_records_read_next_chunk(struct app_context_t *ctx)
 			     ctx->dump_cur_block * ctx->block_size, ctx->dump_write_chunk_bytes,
 			     admin_records_chunk_read_complete, ctx);
 	if (rc != 0) {
+		SPDK_ERRLOG("segment %u: %s reading block %" PRIu64 " (chunk_bytes=%u,"
+			    " dump_records_seen=%" PRIu64 ")\n",
+			    ctx->segment_id, spdk_strerror(-rc), ctx->dump_cur_block,
+			    ctx->dump_write_chunk_bytes, ctx->dump_records_seen);
 		chrono_admin_fulfill(req, rc);
 		return;
 	}
@@ -515,7 +586,11 @@ admin_do_quick_format(struct app_context_t *ctx, struct chrono_admin_request *re
 static void
 admin_do_write_buffers(struct app_context_t *ctx, struct chrono_admin_request *req)
 {
-	if (atomic_load(&ctx->recording)) {
+	/* claim_in_progress too, not just recording - see its comment
+	 * (chrono_ctx.h) for the race this closes: a claim snapshots
+	 * ctx->buf_size/write_buf_count into the TOC several async bdev
+	 * writes before ctx->recording actually flips true. */
+	if (atomic_load(&ctx->recording) || atomic_load(&ctx->claim_in_progress)) {
 		chrono_admin_fulfill(req, -EBUSY);
 		return;
 	}
@@ -525,7 +600,11 @@ admin_do_write_buffers(struct app_context_t *ctx, struct chrono_admin_request *r
 static void
 admin_do_write_chunk(struct app_context_t *ctx, struct chrono_admin_request *req)
 {
-	if (atomic_load(&ctx->recording)) {
+	/* claim_in_progress too, not just recording - see its comment
+	 * (chrono_ctx.h) for the race this closes: a claim snapshots
+	 * ctx->buf_size/write_buf_count into the TOC several async bdev
+	 * writes before ctx->recording actually flips true. */
+	if (atomic_load(&ctx->recording) || atomic_load(&ctx->claim_in_progress)) {
 		chrono_admin_fulfill(req, -EBUSY);
 		return;
 	}

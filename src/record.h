@@ -23,21 +23,27 @@
 #define CHRONO_SEGMENT_MAGIC CHRONO_MAGIC_U64('C', 'H', 'R', 'S', 'E', 'G', '1', ' ')
 
 /* One captured packet's worth of metadata, immediately followed by
- * `len` bytes of the packet's application payload (everything after the
- * 8-byte sequence number dpdk-app-example's wire format embeds - see
- * common.h). Records are packed back-to-back into each write buffer;
- * padding (magic == 0) fills any leftover space at the end of a buffer
- * rather than starting a record that would straddle a write boundary,
- * so a reader can always tell real records from padding.
+ * `len` bytes of the packet's application payload (everything after
+ * dpdk-app-example's optional 8-byte sequence prefix, if the traffic on
+ * this capture's UDP port actually carries one - see common.h's with_seq
+ * and app_opts_t.wire_has_seq). Records are packed back-to-back into each
+ * write buffer; padding (magic == 0) fills any leftover space at the end
+ * of a buffer rather than starting a record that would straddle a write
+ * boundary, so a reader can always tell real records from padding.
  *
- * seq is the sender's own application-level sequence number - useful,
- * but not authoritative for ordering on its own (see resync_events in
- * the dpdk-app-example investigation this project grew out of - a
- * sender restart resets it to 0). capture_tsc is this recorder's own
- * rte_rdtsc() reading at the moment the packet was pulled off the RX
- * ring - the real ordering signal a later sorted-replay pass should
- * use, since it's assigned locally and monotonically regardless of
- * what the sender's sequence numbering is doing. */
+ * seq is THIS CAPTURE'S OWN self-assigned counter (the Nth record
+ * captured this segment, 0-indexed - see capture_poll()), NOT anything
+ * read off the wire. It's gapless and monotonic by construction,
+ * regardless of wire_has_seq or what any particular sender is doing -
+ * verifying it is really just verifying chrontabulator's own capture-to-
+ * disk pipeline didn't lose or reorder anything, not end-to-end sender-
+ * to-storage delivery. A real sender-to-storage sequence validator, if
+ * ever needed, would be a separate, pluggable pass over the raw captured
+ * payload bytes (which still has the sender's own seq in it, if
+ * wire_has_seq was on), not this field. capture_tsc is this recorder's
+ * own rte_rdtsc() reading at the moment the packet was pulled off the RX
+ * ring - the real wall-clock ordering signal a later sorted-replay pass
+ * should use. */
 struct chrono_record_hdr {
 	uint64_t magic;
 	uint64_t seq;

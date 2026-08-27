@@ -60,12 +60,29 @@ struct app_opts_t {
 	uint16_t udp_port;
 	uint16_t mtu;
 	bool force_10g;
+	/* Does inbound traffic on udp_port carry dpdk-app-example's optional
+	 * 8-byte sequence prefix (its own --no-seq/with_seq - see common.h)?
+	 * Only controls where app_parse_packet() finds the real payload -
+	 * chrono_record_hdr.seq is always this capture's own self-assigned,
+	 * gapless record counter regardless (see capture_poll()), never taken
+	 * from the wire, so there's no "sequence monitoring" toggle to keep
+	 * in sync with this one. Default true (matches dpdk-app-example's own
+	 * default) for compatibility with existing test workflows; real
+	 * production traffic (no synthetic prefix) needs --no-wire-seq. */
+	bool wire_has_seq;
 	uint64_t count_limit; /* 0 = unlimited */
 	bool dump_mode;
 	bool init_mode;
 	bool force;
 	bool dump_segment_given;
 	uint32_t dump_segment_id;
+	/* -D -S <id> --repair-chunk-bytes=<N> only: patches this one
+	 * segment's stored write_chunk_bytes (chrono_segment_entry) instead
+	 * of dumping its records - see the claim_in_progress comment
+	 * (chrono_ctx.h) for the now-fixed race that could leave this field
+	 * stale relative to what a segment's data was actually written with.
+	 * 0 = not given (a real write_chunk_bytes is never 0). */
+	uint32_t repair_chunk_bytes;
 	bool serve_mode;
 	uint16_t web_port; /* 0 = daemon runs headless, no web server */
 
@@ -237,6 +254,22 @@ struct app_context_t {
 
 	/* --serve (daemon) mode only. */
 	_Atomic bool recording;
+	/* True for the whole daemon_claim_segment_start()...daemon_claim_
+	 * header_write_complete() window, not just once ctx->recording
+	 * actually flips true - closes a real race found live: the TOC
+	 * entry's write_chunk_bytes (and the write buffer count) are
+	 * snapshotted from ctx->buf_size/write_buf_count right at claim
+	 * start, several async bdev writes before ctx->recording becomes
+	 * true, but admin_do_write_chunk()/admin_do_write_buffers() (chrono_
+	 * admin.c) only checked ctx->recording - a SET_WRITE_CHUNK/
+	 * SET_WRITE_BUFFERS request landing in that narrow window slipped
+	 * past the busy-guard, changed ctx->buf_size/write_buf_count for the
+	 * live capture writes as intended, but left the TOC's own copy
+	 * (already committed to disk) permanently stale - confirmed live: a
+	 * whole 907GB/17.4M-record segment recorded correctly at the new
+	 * chunk size, but with its TOC entry claiming the old default,
+	 * making every reader misinterpret its own chunk boundaries. */
+	_Atomic bool claim_in_progress;
 	_Atomic bool shutting_down;
 	_Atomic uint32_t current_segment_id; /* CHRONO_NO_SEGMENT when idle */
 	/* Mirrors of ctx->vol's fields the web thread needs every 1Hz poll -

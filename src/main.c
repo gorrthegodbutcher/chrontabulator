@@ -75,15 +75,19 @@ enum {
 	CHRONO_OPT_WEB_PORT,
 	CHRONO_OPT_WRITE_BUFFERS,
 	CHRONO_OPT_WRITE_CHUNK_KB,
+	CHRONO_OPT_REPAIR_CHUNK_BYTES,
+	CHRONO_OPT_NO_WIRE_SEQ,
 };
 
 static const struct option chrono_long_opts[] = {
-	{"init",           no_argument,       NULL, CHRONO_OPT_INIT},
-	{"force",          no_argument,       NULL, CHRONO_OPT_FORCE},
-	{"serve",          no_argument,       NULL, CHRONO_OPT_SERVE},
-	{"web-port",       required_argument, NULL, CHRONO_OPT_WEB_PORT},
-	{"write-buffers",  required_argument, NULL, CHRONO_OPT_WRITE_BUFFERS},
-	{"write-chunk-kb", required_argument, NULL, CHRONO_OPT_WRITE_CHUNK_KB},
+	{"init",               no_argument,       NULL, CHRONO_OPT_INIT},
+	{"force",              no_argument,       NULL, CHRONO_OPT_FORCE},
+	{"serve",              no_argument,       NULL, CHRONO_OPT_SERVE},
+	{"web-port",           required_argument, NULL, CHRONO_OPT_WEB_PORT},
+	{"write-buffers",      required_argument, NULL, CHRONO_OPT_WRITE_BUFFERS},
+	{"write-chunk-kb",     required_argument, NULL, CHRONO_OPT_WRITE_CHUNK_KB},
+	{"repair-chunk-bytes", required_argument, NULL, CHRONO_OPT_REPAIR_CHUNK_BYTES},
+	{"no-wire-seq",        no_argument,       NULL, CHRONO_OPT_NO_WIRE_SEQ},
 	{NULL, 0, NULL, 0},
 };
 
@@ -118,6 +122,21 @@ app_usage(void)
 	       MIN_WRITE_CHUNK_BYTES / 1024, MAX_WRITE_CHUNK_BYTES / 1024,
 	       WRITE_CHUNK_TARGET / 1024);
 	printf("                           live-tunable from the web UI while not recording\n");
+	printf(" -D -S <id> --repair-chunk-bytes=<N>\n");
+	printf("                           patch segment <id>'s stored write chunk size instead\n");
+	printf("                           of dumping it - recovery tool for a now-fixed race\n");
+	printf("                           where a SET_WRITE_CHUNK/SET_WRITE_BUFFERS request\n");
+	printf("                           landing between clicking Start and the claim actually\n");
+	printf("                           completing changed the live write chunk size without\n");
+	printf("                           updating the already-committed TOC entry\n");
+	printf(" --no-wire-seq             inbound traffic on -P <port> does NOT carry dpdk-app-\n");
+	printf("                           example's optional 8-byte sequence prefix (its own\n");
+	printf("                           --no-seq/with_seq) - only affects where the real\n");
+	printf("                           payload is found; every captured record's own seq\n");
+	printf("                           field is always this capture's self-assigned, gapless\n");
+	printf("                           counter regardless, never taken from the wire. Default:\n");
+	printf("                           expect the prefix (matches dpdk-app-example's own\n");
+	printf("                           default) - use this for real production traffic\n");
 }
 
 static int
@@ -184,6 +203,18 @@ app_parse_arg(int ch, char *arg)
 		g_ctx.opts.write_chunk_bytes = (uint32_t)(kb * 1024);
 		break;
 	}
+	case CHRONO_OPT_REPAIR_CHUNK_BYTES: {
+		unsigned long bytes = strtoul(arg, NULL, 10);
+		if (bytes == 0 || bytes > MAX_WRITE_CHUNK_BYTES) {
+			fprintf(stderr, "--repair-chunk-bytes must be 1-%d\n", MAX_WRITE_CHUNK_BYTES);
+			return -EINVAL;
+		}
+		g_ctx.opts.repair_chunk_bytes = (uint32_t)bytes;
+		break;
+	}
+	case CHRONO_OPT_NO_WIRE_SEQ:
+		g_ctx.opts.wire_has_seq = false;
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -351,6 +382,19 @@ finalize_header_write_complete(struct spdk_bdev_io *bdev_io, bool success, void 
 	seg->segment_id = ctx->segment_id;
 	seg->state = CHRONO_SEGMENT_FINALIZED;
 	seg->start_block = ctx->segment_start_block;
+	seg->write_chunk_bytes = ctx->buf_size; /* claim already set this, but
+						  * finalize rebuilds the whole
+						  * TOC entry from scratch
+						  * (memset above) rather than a
+						  * true read-modify-write, so it
+						  * has to be repeated here or
+						  * every finalized segment loses
+						  * it - the bug that made every
+						  * segment's data unreadable past
+						  * its first chunk once a
+						  * finalized read had to fall
+						  * back to the READER's own
+						  * (possibly different) buf_size. */
 	seg->block_count = ctx->next_write_block - ctx->segment_start_block;
 	seg->record_count = atomic_load_explicit(&ctx->record_count, memory_order_relaxed);
 	seg->dropped_count = atomic_load_explicit(&ctx->dropped_count, memory_order_relaxed);
@@ -586,7 +630,7 @@ capture_poll(void *arg)
 		const uint8_t *payload;
 		uint32_t payload_len;
 
-		bool is_ours = app_parse_packet(data, len, &dst_port, &seq,
+		bool is_ours = app_parse_packet(data, len, ctx->opts.wire_has_seq, &dst_port, &seq,
 						 &payload, &payload_len) == 0 &&
 				dst_port == ctx->opts.udp_port;
 
@@ -641,15 +685,6 @@ capture_poll(void *arg)
 			}
 		}
 
-		struct chrono_record_hdr *hdr = (struct chrono_record_hdr *)(wb->data + wb->used);
-		hdr->magic = CHRONO_RECORD_MAGIC;
-		hdr->seq = seq;
-		hdr->capture_tsc = now_tsc;
-		hdr->len = payload_len;
-		hdr->reserved = 0;
-		memcpy(wb->data + wb->used + sizeof(*hdr), payload, payload_len);
-		wb->used += rec_size;
-
 		/* capture_poll only ever runs on the reactor thread, never
 		 * concurrently with itself, so these are the sole writers -
 		 * plain load-then-store is enough (no CAS needed); atomics
@@ -657,6 +692,25 @@ capture_poll(void *arg)
 		 * values for /status.json without a lock. */
 		uint64_t new_count = atomic_fetch_add_explicit(&ctx->record_count, 1,
 								memory_order_relaxed) + 1;
+
+		struct chrono_record_hdr *hdr = (struct chrono_record_hdr *)(wb->data + wb->used);
+		hdr->magic = CHRONO_RECORD_MAGIC;
+		/* Self-assigned (this segment's Nth record captured, 0-indexed),
+		 * NOT the wire-parsed seq local above - decouples this format's
+		 * own gapless/monotonic guarantee (verifiable purely from what
+		 * chrontabulator itself wrote, independent of anything a sender
+		 * did or didn't include) from whatever's actually on the wire.
+		 * ctx->opts.wire_has_seq only controls where app_parse_packet()
+		 * finds the real payload, never what ends up in this field -
+		 * see common.h's with_seq. A real sender-to-storage sequence
+		 * validator, if ever built, is a separate, pluggable analysis
+		 * pass over the raw captured payload bytes, not this field. */
+		hdr->seq = new_count - 1;
+		hdr->capture_tsc = now_tsc;
+		hdr->len = payload_len;
+		hdr->reserved = 0;
+		memcpy(wb->data + wb->used + sizeof(*hdr), payload, payload_len);
+		wb->used += rec_size;
 		if (atomic_load_explicit(&ctx->first_capture_tsc, memory_order_relaxed) == 0)
 			atomic_store_explicit(&ctx->first_capture_tsc, now_tsc, memory_order_relaxed);
 		atomic_store_explicit(&ctx->last_capture_tsc, now_tsc, memory_order_relaxed);
@@ -935,6 +989,23 @@ dump_read_next_chunk(struct app_context_t *ctx)
 }
 
 static void
+repair_chunk_bytes_write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct app_context_t *ctx = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		SPDK_ERRLOG("failed to write segment %u's repaired TOC entry\n",
+			    ctx->opts.dump_segment_id);
+		cleanup_and_stop(ctx, -1);
+		return;
+	}
+	printf("Segment %u: write_chunk_bytes repaired to %u.\n", ctx->opts.dump_segment_id,
+	       ctx->opts.repair_chunk_bytes);
+	cleanup_and_stop(ctx, 0);
+}
+
+static void
 dump_segment_entry_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct app_context_t *ctx = cb_arg;
@@ -962,6 +1033,25 @@ dump_segment_entry_read_complete(struct spdk_bdev_io *bdev_io, bool success, voi
 	if (view == CHRONO_SEG_VIEW_DELETED)
 		printf("Segment %u: DELETED (dumping its historical contents anyway)\n",
 		       seg->segment_id);
+
+	if (ctx->opts.repair_chunk_bytes != 0) {
+		int rc;
+
+		SPDK_NOTICELOG("Segment %u: repairing write_chunk_bytes %u -> %u\n",
+			       seg->segment_id, seg->write_chunk_bytes,
+			       ctx->opts.repair_chunk_bytes);
+		seg->write_chunk_bytes = ctx->opts.repair_chunk_bytes;
+		rc = spdk_bdev_write(ctx->bdev_desc, ctx->bdev_io_channel, ctx->io_buf,
+				      (ctx->vol.toc_start_block + ctx->opts.dump_segment_id) *
+				      ctx->block_size, ctx->block_size,
+				      repair_chunk_bytes_write_complete, ctx);
+		if (rc != 0) {
+			SPDK_ERRLOG("%s repairing segment %u's TOC entry\n", spdk_strerror(-rc),
+				    ctx->opts.dump_segment_id);
+			cleanup_and_stop(ctx, -1);
+		}
+		return;
+	}
 
 	printf("Segment %u: record_count=%" PRIu64 " dropped_count=%" PRIu64
 	       " tsc_hz=%" PRIu64 "\n", seg->segment_id, seg->record_count,
@@ -1377,6 +1467,19 @@ daemon_finalize_header_write_complete(struct spdk_bdev_io *bdev_io, bool success
 	seg->segment_id = ctx->segment_id;
 	seg->state = CHRONO_SEGMENT_FINALIZED;
 	seg->start_block = ctx->segment_start_block;
+	seg->write_chunk_bytes = ctx->buf_size; /* claim already set this, but
+						  * finalize rebuilds the whole
+						  * TOC entry from scratch
+						  * (memset above) rather than a
+						  * true read-modify-write, so it
+						  * has to be repeated here or
+						  * every finalized segment loses
+						  * it - the bug that made every
+						  * segment's data unreadable past
+						  * its first chunk once a
+						  * finalized read had to fall
+						  * back to the READER's own
+						  * (possibly different) buf_size. */
 	seg->block_count = ctx->next_write_block - ctx->segment_start_block;
 	seg->record_count = atomic_load_explicit(&ctx->record_count, memory_order_relaxed);
 	seg->dropped_count = atomic_load_explicit(&ctx->dropped_count, memory_order_relaxed);
@@ -1449,6 +1552,7 @@ daemon_claim_header_write_complete(struct spdk_bdev_io *bdev_io, bool success, v
 	if (!success) {
 		SPDK_ERRLOG("failed to record segment %u's claim in the volume header\n",
 			    ctx->segment_id);
+		atomic_store_explicit(&ctx->claim_in_progress, false, memory_order_relaxed);
 		chrono_admin_fulfill(&ctx->admin_req, -EIO);
 		return;
 	}
@@ -1475,6 +1579,11 @@ daemon_claim_header_write_complete(struct spdk_bdev_io *bdev_io, bool success, v
 	ctx->stopping = false;
 
 	atomic_store_explicit(&ctx->current_segment_id, ctx->segment_id, memory_order_relaxed);
+	/* recording=true takes over as the write-chunk/write-buffer-count
+	 * busy-guard from here on - see claim_in_progress's comment
+	 * (chrono_ctx.h) for why both are needed across this whole
+	 * function's window, not just this one. */
+	atomic_store_explicit(&ctx->claim_in_progress, false, memory_order_relaxed);
 	atomic_store_explicit(&ctx->recording, true, memory_order_relaxed);
 
 	/* rx_poller is already running (registered once at daemon startup -
@@ -1496,6 +1605,7 @@ daemon_claim_toc_write_complete(struct spdk_bdev_io *bdev_io, bool success, void
 		spdk_bdev_free_io(bdev_io);
 	if (!success) {
 		SPDK_ERRLOG("failed to claim a segment slot\n");
+		atomic_store_explicit(&ctx->claim_in_progress, false, memory_order_relaxed);
 		chrono_admin_fulfill(&ctx->admin_req, -EIO);
 		return;
 	}
@@ -1509,6 +1619,7 @@ daemon_claim_toc_write_complete(struct spdk_bdev_io *bdev_io, bool success, void
 			      daemon_claim_header_write_complete, ctx);
 	if (rc != 0) {
 		SPDK_ERRLOG("%s recording segment claim in volume header\n", spdk_strerror(-rc));
+		atomic_store_explicit(&ctx->claim_in_progress, false, memory_order_relaxed);
 		chrono_admin_fulfill(&ctx->admin_req, rc);
 	}
 }
@@ -1530,6 +1641,8 @@ daemon_claim_segment_start(struct app_context_t *ctx)
 		chrono_admin_fulfill(&ctx->admin_req, -ENOSPC);
 		return;
 	}
+
+	atomic_store_explicit(&ctx->claim_in_progress, true, memory_order_relaxed);
 
 	ctx->segment_id = ctx->vol.next_segment_id;
 	ctx->segment_start_block = ctx->vol.next_data_block;
@@ -1553,6 +1666,7 @@ daemon_claim_segment_start(struct app_context_t *ctx)
 			      ctx->block_size, daemon_claim_toc_write_complete, ctx);
 	if (rc != 0) {
 		SPDK_ERRLOG("%s claiming segment %u\n", spdk_strerror(-rc), ctx->segment_id);
+		atomic_store_explicit(&ctx->claim_in_progress, false, memory_order_relaxed);
 		chrono_admin_fulfill(&ctx->admin_req, rc);
 	}
 }
@@ -2028,6 +2142,7 @@ main(int argc, char **argv)
 				     * means headless - see app_parse_arg(). */
 	g_ctx.opts.write_buf_count = DEFAULT_WRITE_BUFFERS;
 	g_ctx.opts.write_chunk_bytes = WRITE_CHUNK_TARGET;
+	g_ctx.opts.wire_has_seq = true;
 
 	spdk_app_opts_init(&opts, sizeof(opts));
 	opts.name = "chrontabulator";
