@@ -616,6 +616,25 @@ flush_buffer(struct app_context_t *ctx, int idx)
 	ctx->pending_writes++;
 	retry_flush(wb);
 	ctx->next_write_block += ctx->buf_size_blocks;
+
+	/* mirror_next_data_block is normally the volume header's own
+	 * committed high-water mark, updated only at finalize (see
+	 * daemon_finalize_header_write_complete()/claim_segment_start()) -
+	 * that's the crash-safe value, and it deliberately does NOT track an
+	 * open segment's in-progress growth (an orphaned segment's space is
+	 * meant to be silently reclaimed by the next run, not counted as
+	 * "used" if the process dies first). But that same lag makes the web
+	 * status page's data_used/data_free_bytes freeze at whatever they
+	 * were when the current segment was claimed, for the entire length
+	 * of a long recording - not wrong exactly, but not what "how full is
+	 * the drive right now" should show a live viewer. Advancing this
+	 * mirror here too (in addition to finalize) keeps the live display
+	 * accurate without touching the actual on-disk/persisted value or
+	 * its crash-recovery semantics at all - this is purely the in-memory
+	 * atomic other threads read, never what --init/claim/finalize write
+	 * to block 0. */
+	atomic_store_explicit(&ctx->mirror_next_data_block, ctx->next_write_block,
+			       memory_order_relaxed);
 }
 
 static int

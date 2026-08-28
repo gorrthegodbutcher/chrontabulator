@@ -208,9 +208,25 @@ admin_list_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, void 
 				seg->start_block, seg->block_count, seg->record_count,
 				seg->dropped_count, start_str, end_str, duration);
 		} else {
+			/* seg->block_count itself isn't authoritative while OPEN
+			 * (only ever written at finalize) - but if this happens
+			 * to be the segment currently being recorded, ctx's own
+			 * live reactor-thread fields (safe to read directly here,
+			 * this handler already runs on the reactor thread) give
+			 * an accurate in-progress size, which is exactly what the
+			 * web UI's disk-usage chart needs to grow live instead of
+			 * freezing at 0 for a segment's entire open duration. Any
+			 * OTHER open segment is a crashed/orphaned one from a
+			 * prior run - genuinely unknown size, left at 0 (matches
+			 * "recovering an orphaned segment is out of scope"). */
+			uint64_t live_block_count =
+				(atomic_load(&ctx->recording) && seg->segment_id == ctx->segment_id) ?
+				ctx->next_write_block - ctx->segment_start_block : 0;
+
 			admin_buf_appendf(req,
 				"%s{\"segment_id\":%u,\"state\":\"open\",\"start_block\":%"
-				PRIu64 "}", first ? "" : ",", seg->segment_id, seg->start_block);
+				PRIu64 ",\"block_count\":%" PRIu64 "}", first ? "" : ",",
+				seg->segment_id, seg->start_block, live_block_count);
 		}
 		/* Reused for "entries actually included" here, same as its
 		 * SEGMENT_RECORDS use - the two never run concurrently
