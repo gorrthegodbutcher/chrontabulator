@@ -370,7 +370,7 @@ struct app_context_t {
 	 * triggering admin op (CHRONO_ADMIN_SEGMENT_EXTRACT_START, chrono_
 	 * admin.c) only reads the segment's TOC entry and kicks this off;
 	 * from then on it runs entirely detached, on its own dedicated state
-	 * below (deliberately NOT the dump_*/io_buf fields above - those are
+	 * below (deliberately NOT the dump_* / io_buf fields above - those are
 	 * only safe to share because exactly one admin request is ever in
 	 * flight at a time, an invariant this long-running, self-reinvoking
 	 * chain would otherwise violate against any admin call that lands
@@ -410,13 +410,15 @@ struct app_context_t {
 	 * e.g. start_time above). Purely for display (the web UI's status
 	 * poll echoes back what's being written where). */
 	char extract_output_path[320];
-	FILE *extract_file;    /* opened by the web thread before dispatch,
-				  * owned by the reactor thread from dispatch
-				  * onward - closed exactly once, by whichever
-				  * reactor-side path ends the run (early
-				  * validation failure in chrono_admin.c, or
-				  * extract_finish() once the chunk walk is
-				  * done). */
+	/* ctx->extract_file (declared above, with the CLI -D -S <id>
+	 * --extract=<path> fields) is reused here too - CLI dump mode and
+	 * --serve mode never run in the same process invocation, same
+	 * sharing rationale as every other dump_* or init_* field in this
+	 * struct. Web-mode specifics: opened by the web thread before
+	 * dispatch, owned by the reactor thread from dispatch onward -
+	 * closed exactly once, by whichever reactor-side path ends the run
+	 * (early validation failure in chrono_admin.c, or extract_finish(),
+	 * once the chunk walk is done). */
 	uint8_t *extract_buf;   /* dedicated MAX_WRITE_CHUNK_BYTES DMA buffer
 				   * for the chunk walk above - NOT ctx->io_buf,
 				   * which a concurrent admin call (list/
