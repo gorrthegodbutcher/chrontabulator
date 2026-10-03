@@ -243,6 +243,25 @@ render_status_json(struct app_context_t *ctx, char *out, size_t out_size)
 	const char *stop_reason = stop_reason_str(
 		atomic_load_explicit(&ctx->last_stop_reason, memory_order_relaxed));
 
+	bool extracting = atomic_load_explicit(&ctx->extracting, memory_order_relaxed);
+	uint32_t extract_seg = atomic_load_explicit(&ctx->extract_segment_id, memory_order_relaxed);
+	uint64_t extract_records_done = atomic_load_explicit(&ctx->extract_records_done,
+							       memory_order_relaxed);
+	uint64_t extract_records_total = atomic_load_explicit(&ctx->extract_records_total,
+								memory_order_relaxed);
+	uint64_t extract_bytes_done = atomic_load_explicit(&ctx->extract_bytes_done,
+							     memory_order_relaxed);
+	bool extract_capped = atomic_load_explicit(&ctx->extract_capped, memory_order_relaxed);
+	bool extract_have_result = atomic_load_explicit(&ctx->extract_have_result,
+							   memory_order_relaxed);
+	int extract_last_rc = atomic_load_explicit(&ctx->extract_last_rc, memory_order_relaxed);
+	char extract_last_error_json[64];
+	if (!extract_have_result || extract_last_rc == 0)
+		snprintf(extract_last_error_json, sizeof(extract_last_error_json), "null");
+	else
+		snprintf(extract_last_error_json, sizeof(extract_last_error_json),
+			 "\"%s\"", strerror(-extract_last_rc));
+
 	struct rte_eth_stats hw;
 	struct rte_eth_link link;
 	bool have_hw = rte_eth_stats_get(ctx->port, &hw) == 0;
@@ -311,7 +330,16 @@ render_status_json(struct app_context_t *ctx, char *out, size_t out_size)
 		"  \"startup_count_limit\": %" PRIu64 ",\n"
 		"  \"startup_write_buf_count\": %u,\n"
 		"  \"startup_write_chunk_bytes\": %u,\n"
-		"  \"startup_wire_has_seq\": %s\n"
+		"  \"startup_wire_has_seq\": %s,\n"
+		"  \"extracting\": %s,\n"
+		"  \"extract_segment_id\": %u,\n"
+		"  \"extract_records_done\": %" PRIu64 ",\n"
+		"  \"extract_records_total\": %" PRIu64 ",\n"
+		"  \"extract_bytes_done\": %" PRIu64 ",\n"
+		"  \"extract_have_result\": %s,\n"
+		"  \"extract_capped\": %s,\n"
+		"  \"extract_last_error\": %s,\n"
+		"  \"extract_output_path\": \"%s\"\n"
 		"}\n",
 		(long)(time(NULL) - ctx->start_time),
 		recording ? "true" : "false", seg_id_json,
@@ -337,7 +365,13 @@ render_status_json(struct app_context_t *ctx, char *out, size_t out_size)
 		ctx->opts.mtu, ctx->opts.force_10g ? "true" : "false",
 		ctx->opts.udp_port, ctx->opts.count_limit,
 		ctx->opts.write_buf_count, ctx->opts.write_chunk_bytes,
-		ctx->opts.wire_has_seq ? "true" : "false");
+		ctx->opts.wire_has_seq ? "true" : "false",
+		extracting ? "true" : "false", extract_seg,
+		extract_records_done, extract_records_total, extract_bytes_done,
+		extract_have_result ? "true" : "false",
+		extract_capped ? "true" : "false",
+		extract_last_error_json,
+		ctx->extract_output_path);
 }
 
 /* EAL/DPDK-level diagnostics, separate from the app-level counters in
@@ -396,6 +430,23 @@ render_eal_json(struct app_context_t *ctx, char *out, size_t out_size)
 		heap_stats.alloc_count, heap_stats.free_count);
 }
 
+/* The browser only ever supplies a bare filename for "POST /segments/<id>/
+ * extract" (see ctx->opts.extract_dir's comment, chrono_ctx.h) - reject
+ * anything that could escape that directory or isn't a sane filename at
+ * all, rather than try to canonicalize/strip it. No path separators means
+ * no "../" traversal either, without needing to special-case it. */
+static bool
+extract_filename_is_safe(const char *name)
+{
+	if (name[0] == '\0')
+		return false;
+	for (const char *p = name; *p; p++) {
+		if (*p == '/' || *p == '\\' || *p == '"' || (unsigned char)*p < 0x20)
+			return false;
+	}
+	return true;
+}
+
 static void
 send_admin_result(int fd, int rc, struct chrono_admin_request *req)
 {
@@ -432,7 +483,7 @@ handle_connection(int fd, struct app_context_t *ctx)
 	read_request_line(fd, request_line, sizeof(request_line));
 
 	if (strncmp(request_line, "GET /status.json ", strlen("GET /status.json ")) == 0) {
-		char json[2048];
+		char json[3072];
 		render_status_json(ctx, json, sizeof(json));
 		send_response(fd, "200 OK", "application/json", json);
 	} else if (strncmp(request_line, "GET /eal.json ", strlen("GET /eal.json ")) == 0) {
@@ -472,6 +523,55 @@ handle_connection(int fd, struct app_context_t *ctx)
 		req->req_segment_id = seg_id;
 		rc = chrono_admin_call(ctx, req, ADMIN_TIMEOUT_SEC);
 		send_admin_result(fd, rc == 0 ? req->rc : rc, req);
+	} else if (parse_segment_path(request_line, "POST /segments/", &seg_id, &rest) &&
+		   strncmp(rest, "/extract", strlen("/extract")) == 0) {
+		char filename[256];
+		uint64_t max_bytes;
+
+		query_get_str(rest, "filename", filename, sizeof(filename));
+		if (!extract_filename_is_safe(filename)) {
+			send_response(fd, "400 Bad Request", "application/json",
+				      "{\"error\":\"missing or invalid filename\"}\n");
+		} else if (atomic_load_explicit(&ctx->extracting, memory_order_relaxed)) {
+			send_response(fd, "409 Conflict", "application/json",
+				      "{\"error\":\"an extraction is already in progress\"}\n");
+		} else {
+			char full_path[sizeof(ctx->extract_output_path)];
+			int path_len = snprintf(full_path, sizeof(full_path), "%s/%s",
+						 ctx->opts.extract_dir, filename);
+
+			if (path_len < 0 || (size_t)path_len >= sizeof(full_path)) {
+				send_response(fd, "400 Bad Request", "application/json",
+					      "{\"error\":\"filename too long\"}\n");
+			} else {
+				FILE *f = fopen(full_path, "wb");
+
+				if (!f) {
+					char body[300];
+					snprintf(body, sizeof(body), "{\"error\":\"%s\"}\n",
+						 strerror(errno));
+					send_response(fd, "400 Bad Request", "application/json", body);
+				} else {
+					/* Ownership of both passes to the reactor
+					 * thread the instant we dispatch below - see
+					 * the big comment on app_context_t's extract_*
+					 * fields (chrono_ctx.h). This handler never
+					 * touches either again regardless of the
+					 * result. */
+					ctx->extract_file = f;
+					strncpy(ctx->extract_output_path, full_path,
+						sizeof(ctx->extract_output_path) - 1);
+					ctx->extract_output_path[sizeof(ctx->extract_output_path) - 1] = '\0';
+
+					req->op = CHRONO_ADMIN_SEGMENT_EXTRACT_START;
+					req->req_segment_id = seg_id;
+					req->req_extract_max_bytes =
+						query_get_uint(rest, "max_bytes", &max_bytes) ? max_bytes : 0;
+					rc = chrono_admin_call(ctx, req, ADMIN_TIMEOUT_SEC);
+					send_admin_result(fd, rc == 0 ? req->rc : rc, req);
+				}
+			}
+		}
 	} else if (strncmp(request_line, "POST /quick-format", strlen("POST /quick-format")) == 0) {
 		/* Destructive and irreversible (segment metadata, not the
 		 * underlying data bytes - see the QUICK_FORMAT comment in

@@ -80,6 +80,7 @@ enum {
 	CHRONO_OPT_NO_WIRE_SEQ,
 	CHRONO_OPT_STRIP_VLAN,
 	CHRONO_OPT_EXTRACT,
+	CHRONO_OPT_EXTRACT_DIR,
 };
 
 static const struct option chrono_long_opts[] = {
@@ -93,6 +94,7 @@ static const struct option chrono_long_opts[] = {
 	{"no-wire-seq",        no_argument,       NULL, CHRONO_OPT_NO_WIRE_SEQ},
 	{"strip-vlan",         no_argument,       NULL, CHRONO_OPT_STRIP_VLAN},
 	{"extract",            required_argument, NULL, CHRONO_OPT_EXTRACT},
+	{"extract-dir",        required_argument, NULL, CHRONO_OPT_EXTRACT_DIR},
 	{NULL, 0, NULL, 0},
 };
 
@@ -156,6 +158,10 @@ app_usage(void)
 	printf("                           length, or timestamp framing of any kind added -\n");
 	printf("                           just the bytes that followed the UDP header on the\n");
 	printf("                           wire. Overwrites <path> if it already exists.\n");
+	printf(" --extract-dir=<dir>       --serve only: base directory the web UI's segment\n");
+	printf("                           \"Extract\" button writes into (default \".\" - the\n");
+	printf("                           daemon's own working directory). The browser only\n");
+	printf("                           ever supplies a filename, never a path.\n");
 }
 
 static int
@@ -239,6 +245,9 @@ app_parse_arg(int ch, char *arg)
 		break;
 	case CHRONO_OPT_EXTRACT:
 		g_ctx.opts.extract_path = arg;
+		break;
+	case CHRONO_OPT_EXTRACT_DIR:
+		g_ctx.opts.extract_dir = arg;
 		break;
 	default:
 		return -EINVAL;
@@ -330,6 +339,8 @@ fail_started(struct app_context_t *ctx)
 		spdk_dma_free(ctx->vol_buf);
 	if (ctx->io_buf)
 		spdk_dma_free(ctx->io_buf);
+	if (ctx->extract_buf)
+		spdk_dma_free(ctx->extract_buf);
 	if (ctx->extract_file)
 		fclose(ctx->extract_file);
 	if (ctx->bdev_io_channel)
@@ -354,6 +365,8 @@ cleanup_and_stop(struct app_context_t *ctx, int rc)
 		spdk_dma_free(ctx->vol_buf);
 	if (ctx->io_buf)
 		spdk_dma_free(ctx->io_buf);
+	if (ctx->extract_buf)
+		spdk_dma_free(ctx->extract_buf);
 	if (ctx->extract_file)
 		fclose(ctx->extract_file);
 	if (ctx->bdev_io_channel)
@@ -2102,6 +2115,20 @@ daemon_finish_startup(struct app_context_t *ctx)
 		}
 	}
 
+	/* Web-triggered segment extraction's own dedicated scratch buffer -
+	 * NOT ctx->io_buf, which a concurrent, still-bounded admin call
+	 * (list/records/delete) could legitimately be using while a
+	 * detached extraction is mid-walk - see the big comment on
+	 * app_context_t's extract_* fields (chrono_ctx.h). Daemon-mode-only:
+	 * CLI dump mode's own -S <id> --extract=<path> has no such
+	 * concurrency to guard against, so it keeps using io_buf. */
+	ctx->extract_buf = spdk_dma_zmalloc(MAX_WRITE_CHUNK_BYTES, buf_align, NULL);
+	if (!ctx->extract_buf) {
+		SPDK_ERRLOG("Failed to allocate extraction buffer\n");
+		fail_started(ctx);
+		return;
+	}
+
 	if (chrono_admin_init(ctx) != 0) {
 		SPDK_ERRLOG("Failed to initialize the admin bridge\n");
 		fail_started(ctx);
@@ -2326,6 +2353,7 @@ main(int argc, char **argv)
 	g_ctx.opts.write_buf_count = DEFAULT_WRITE_BUFFERS;
 	g_ctx.opts.write_chunk_bytes = WRITE_CHUNK_TARGET;
 	g_ctx.opts.wire_has_seq = true;
+	g_ctx.opts.extract_dir = ".";
 
 	spdk_app_opts_init(&opts, sizeof(opts));
 	opts.name = "chrontabulator";

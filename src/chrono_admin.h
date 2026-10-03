@@ -41,6 +41,12 @@ enum chrono_admin_op {
 	CHRONO_ADMIN_SET_WRITE_CHUNK,
 	CHRONO_ADMIN_SET_WIRE_HAS_SEQ,
 	CHRONO_ADMIN_SET_LOCAL_IP,
+	/* Validates the segment + kicks off main.c-style payload extraction
+	 * to ctx->extract_file (already opened by the web thread), then
+	 * fulfills immediately - the actual chunk walk runs detached from
+	 * this request from that point on. See the comment on
+	 * app_context_t's extract_* fields (chrono_ctx.h) for why. */
+	CHRONO_ADMIN_SEGMENT_EXTRACT_START,
 };
 
 struct chrono_admin_request {
@@ -73,6 +79,7 @@ struct chrono_admin_request {
 	bool req_have_local_ip;         /* SET_LOCAL_IP - false means "stop
 					  * answering ARP/ICMP-echo entirely",
 					  * same as never passing -I at all */
+	uint64_t req_extract_max_bytes; /* SEGMENT_EXTRACT_START - 0 = unlimited */
 
 	/* response */
 	int rc; /* 0 = success, negative errno-style on failure */

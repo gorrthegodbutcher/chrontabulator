@@ -101,6 +101,16 @@ struct app_opts_t {
 	bool serve_mode;
 	uint16_t web_port; /* 0 = daemon runs headless, no web server */
 
+	/* --serve mode only: base directory the web UI's "POST /segments/
+	 * <id>/extract" writes into (see app_context_t's extract_* fields
+	 * below) - the browser only ever supplies a bare filename, never a
+	 * path, so this is what anchors it on disk. Default "." (the
+	 * daemon's own working directory) if never given. Not validated at
+	 * startup - an unwritable/missing directory just surfaces as a
+	 * per-request fopen() failure, same as any other bad --extract=<path>
+	 * target. */
+	char *extract_dir;
+
 	/* -I <ip>: the address net_responder.c answers ARP/ICMP-echo for.
 	 * Optional - if never given, have_local_ip stays false and
 	 * net_responder_try_handle() never matches anything, so behavior is
@@ -349,6 +359,79 @@ struct app_context_t {
 	 * against. A separate scratch buffer would just be another
 	 * allocation with nothing to protect. */
 	struct chrono_admin_request admin_req;
+
+	/* --serve mode only: "POST /segments/<id>/extract"'s own payload-only
+	 * dump to a local file, same idea as the CLI's -D -S <id>
+	 * --extract=<path> but web-triggered and necessarily asynchronous -
+	 * a segment can be arbitrarily large (this project's own README
+	 * documents a 907GB/17.4M-record test capture), far past what any
+	 * single bounded HTTP request/admin_req round trip
+	 * (chrono_admin_call(), 3s-30s today) could ever wait out. The
+	 * triggering admin op (CHRONO_ADMIN_SEGMENT_EXTRACT_START, chrono_
+	 * admin.c) only reads the segment's TOC entry and kicks this off;
+	 * from then on it runs entirely detached, on its own dedicated state
+	 * below (deliberately NOT the dump_*/io_buf fields above - those are
+	 * only safe to share because exactly one admin request is ever in
+	 * flight at a time, an invariant this long-running, self-reinvoking
+	 * chain would otherwise violate against any admin call that lands
+	 * while it's still going). Progress is exposed to the web UI's
+	 * existing 1Hz /status.json poll purely through the atomics below -
+	 * same "Tier 1: no bridge needed" tier as record_count/dropped_count
+	 * (see web_status.c's render_status_json()). */
+	_Atomic bool extracting;
+	_Atomic uint32_t extract_segment_id;
+	_Atomic uint64_t extract_records_done;
+	_Atomic uint64_t extract_records_total;
+	_Atomic uint64_t extract_bytes_done;
+	_Atomic uint64_t extract_max_bytes; /* 0 = unlimited; "only grab the
+					       * first N bytes" cap from the
+					       * request that started this
+					       * run - checked before writing
+					       * each record, so the finished
+					       * file is never bigger than
+					       * this, though it may be
+					       * smaller (stops at a whole-
+					       * record boundary, never mid-
+					       * record). */
+	_Atomic bool extract_capped;       /* true if the run above stopped
+					      * early because of extract_max_bytes,
+					      * false if it ran to the segment's
+					      * actual end - meaningful once
+					      * extract_have_result is true. */
+	_Atomic int extract_last_rc;       /* 0 = success, negative errno
+					      * otherwise - result of the most
+					      * recently finished run. */
+	_Atomic bool extract_have_result;  /* false until a run has actually
+					      * finished at least once. */
+	/* Written once, from the web thread, right before dispatching
+	 * CHRONO_ADMIN_SEGMENT_EXTRACT_START - never touched again until the
+	 * NEXT extraction starts (guarded by extracting, same "write once,
+	 * then only read" shortcut already used elsewhere in this struct,
+	 * e.g. start_time above). Purely for display (the web UI's status
+	 * poll echoes back what's being written where). */
+	char extract_output_path[320];
+	FILE *extract_file;    /* opened by the web thread before dispatch,
+				  * owned by the reactor thread from dispatch
+				  * onward - closed exactly once, by whichever
+				  * reactor-side path ends the run (early
+				  * validation failure in chrono_admin.c, or
+				  * extract_finish() once the chunk walk is
+				  * done). */
+	uint8_t *extract_buf;   /* dedicated MAX_WRITE_CHUNK_BYTES DMA buffer
+				   * for the chunk walk above - NOT ctx->io_buf,
+				   * which a concurrent admin call (list/
+				   * records/delete, all still bounded and
+				   * synchronous) could legitimately be using
+				   * at the same time as this detached, long-
+				   * running scan. */
+	uint64_t extract_cur_block;
+	uint32_t extract_write_chunk_bytes; /* this segment's own stored
+					       * write_chunk_bytes - same
+					       * reasoning as dump_write_chunk_bytes
+					       * above, just a separate copy so
+					       * the two scans can't stomp on
+					       * each other. */
+	uint32_t extract_write_chunk_blocks;
 };
 
 #endif

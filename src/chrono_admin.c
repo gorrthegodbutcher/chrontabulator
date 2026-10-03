@@ -650,6 +650,218 @@ admin_do_set_local_ip(struct app_context_t *ctx, struct chrono_admin_request *re
 	daemon_set_local_ip(ctx, req->req_local_ip, req->req_have_local_ip);
 }
 
+/* ---- SEGMENT_EXTRACT_START: validate, then detach - see the long comment
+ * on app_context_t's extract_* fields (chrono_ctx.h) for why this can't
+ * stay inside the normal bounded chrono_admin_call()/admin_req shape every
+ * other op above uses. This handler (and the one TOC-entry read it issues)
+ * is the only part that still goes through req/admin_req; everything after
+ * chrono_admin_fulfill() runs as its own self-contained chain, touching
+ * only ctx->extract_* and ctx->extract_buf, never req or ctx->io_buf
+ * again. ---- */
+
+static void extract_read_next_chunk(struct app_context_t *ctx);
+
+/* Terminal step of the detached chunk walk below, reached by every exit
+ * path (clean finish, cap hit, read/write error) - always closes
+ * ctx->extract_file exactly once and publishes the result before clearing
+ * extracting, so a web-thread status poll that observes extracting==false
+ * can trust extract_last_rc/extract_capped are already settled (plain
+ * relaxed atomics, same "good enough for display data" reasoning as this
+ * file's other progress counters - see record_count's comment in
+ * chrono_ctx.h). */
+static void
+extract_finish(struct app_context_t *ctx, int rc)
+{
+	fclose(ctx->extract_file);
+	ctx->extract_file = NULL;
+	atomic_store_explicit(&ctx->extract_last_rc, rc, memory_order_relaxed);
+	atomic_store_explicit(&ctx->extract_have_result, true, memory_order_relaxed);
+	atomic_store_explicit(&ctx->extracting, false, memory_order_relaxed);
+}
+
+static void
+extract_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct app_context_t *ctx = cb_arg;
+	uint32_t offset = 0;
+	uint64_t records_done = atomic_load_explicit(&ctx->extract_records_done, memory_order_relaxed);
+	uint64_t records_total = atomic_load_explicit(&ctx->extract_records_total, memory_order_relaxed);
+	uint64_t max_bytes = atomic_load_explicit(&ctx->extract_max_bytes, memory_order_relaxed);
+	uint64_t bytes_done = atomic_load_explicit(&ctx->extract_bytes_done, memory_order_relaxed);
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		SPDK_ERRLOG("segment %u extract: read failed at block %" PRIu64 "\n",
+			    atomic_load_explicit(&ctx->extract_segment_id, memory_order_relaxed),
+			    ctx->extract_cur_block);
+		extract_finish(ctx, -EIO);
+		return;
+	}
+
+	while (offset + sizeof(struct chrono_record_hdr) <= ctx->extract_write_chunk_bytes &&
+	       records_done < records_total) {
+		struct chrono_record_hdr *hdr = (struct chrono_record_hdr *)(ctx->extract_buf + offset);
+
+		if (hdr->magic != CHRONO_RECORD_MAGIC)
+			break; /* this chunk's own tail padding - see the CLI's
+				* dump_chunk_read_complete() for why that's not
+				* the same as "end of segment" */
+		if (offset + sizeof(*hdr) + hdr->len > ctx->extract_write_chunk_bytes) {
+			SPDK_ERRLOG("segment %u extract: record at block %" PRIu64 " offset %u"
+				    " claims len %u, overruns the write chunk - stopping\n",
+				    atomic_load_explicit(&ctx->extract_segment_id, memory_order_relaxed),
+				    ctx->extract_cur_block, offset, hdr->len);
+			extract_finish(ctx, -EIO);
+			return;
+		}
+
+		if (max_bytes != 0 && bytes_done + hdr->len > max_bytes) {
+			/* Cap reached - stop cleanly at a whole-record boundary
+			 * (never write a partial payload) rather than treat
+			 * this as an error. */
+			atomic_store_explicit(&ctx->extract_capped, true, memory_order_relaxed);
+			extract_finish(ctx, 0);
+			return;
+		}
+
+		if (hdr->len > 0 && fwrite(hdr + 1, 1, hdr->len, ctx->extract_file) != hdr->len) {
+			SPDK_ERRLOG("segment %u extract: write error to %s\n",
+				    atomic_load_explicit(&ctx->extract_segment_id, memory_order_relaxed),
+				    ctx->extract_output_path);
+			extract_finish(ctx, -EIO);
+			return;
+		}
+		bytes_done += hdr->len;
+		records_done++;
+		atomic_store_explicit(&ctx->extract_bytes_done, bytes_done, memory_order_relaxed);
+		atomic_store_explicit(&ctx->extract_records_done, records_done, memory_order_relaxed);
+
+		offset += (uint32_t)sizeof(*hdr) + hdr->len;
+	}
+
+	ctx->extract_cur_block += ctx->extract_write_chunk_blocks;
+
+	if (records_done >= records_total) {
+		extract_finish(ctx, 0);
+		return;
+	}
+	if (offset == 0) {
+		/* Hit padding immediately, at the very start of a fresh chunk -
+		 * genuinely out of real data, not just this chunk's tail (same
+		 * check as the CLI/admin_records_chunk_read_complete()). */
+		SPDK_ERRLOG("segment %u extract: expected %" PRIu64 " records, only found %"
+			    PRIu64 " before hitting unwritten space\n",
+			    atomic_load_explicit(&ctx->extract_segment_id, memory_order_relaxed),
+			    records_total, records_done);
+		extract_finish(ctx, -EIO);
+		return;
+	}
+
+	extract_read_next_chunk(ctx);
+}
+
+static void
+extract_read_next_chunk(struct app_context_t *ctx)
+{
+	int rc;
+
+	rc = spdk_bdev_read(ctx->bdev_desc, ctx->bdev_io_channel, ctx->extract_buf,
+			     ctx->extract_cur_block * ctx->block_size, ctx->extract_write_chunk_bytes,
+			     extract_chunk_read_complete, ctx);
+	if (rc != 0) {
+		SPDK_ERRLOG("segment %u extract: %s reading block %" PRIu64 "\n",
+			    atomic_load_explicit(&ctx->extract_segment_id, memory_order_relaxed),
+			    spdk_strerror(-rc), ctx->extract_cur_block);
+		extract_finish(ctx, rc);
+	}
+}
+
+/* Still part of the bounded admin_req request/response - this is the ONE
+ * bdev_read (the segment's TOC entry) that chrono_admin_call()'s web-thread
+ * wait actually covers. Everything from extract_read_next_chunk() onward,
+ * called right before returning here, is detached (see the big comment
+ * above). */
+static void
+admin_extract_entry_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct app_context_t *ctx = cb_arg;
+	struct chrono_admin_request *req = &ctx->admin_req;
+	struct chrono_segment_entry *seg = (struct chrono_segment_entry *)ctx->io_buf;
+	enum chrono_segment_view view;
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		fclose(ctx->extract_file);
+		ctx->extract_file = NULL;
+		chrono_admin_fulfill(req, -EIO);
+		return;
+	}
+
+	view = chrono_segment_classify(seg);
+	if (view == CHRONO_SEG_VIEW_NOT_FOUND || view == CHRONO_SEG_VIEW_OPEN) {
+		fclose(ctx->extract_file);
+		ctx->extract_file = NULL;
+		chrono_admin_fulfill(req, -ENOENT);
+		return;
+	}
+
+	if (seg->record_count == 0) {
+		/* Nothing to walk - a valid, empty result, not an error. */
+		fclose(ctx->extract_file);
+		ctx->extract_file = NULL;
+		chrono_admin_fulfill(req, 0);
+		return;
+	}
+
+	atomic_store_explicit(&ctx->extract_segment_id, seg->segment_id, memory_order_relaxed);
+	atomic_store_explicit(&ctx->extract_records_total, seg->record_count, memory_order_relaxed);
+	atomic_store_explicit(&ctx->extract_records_done, 0, memory_order_relaxed);
+	atomic_store_explicit(&ctx->extract_bytes_done, 0, memory_order_relaxed);
+	atomic_store_explicit(&ctx->extract_capped, false, memory_order_relaxed);
+	atomic_store_explicit(&ctx->extract_have_result, false, memory_order_relaxed);
+	atomic_store_explicit(&ctx->extract_max_bytes, req->req_extract_max_bytes, memory_order_relaxed);
+	/* 0 means this segment predates write_chunk_bytes being recorded (an
+	 * older binary) - same fallback as dump_segment_entry_read_complete(). */
+	ctx->extract_write_chunk_bytes = seg->write_chunk_bytes != 0 ?
+		seg->write_chunk_bytes : ctx->buf_size;
+	ctx->extract_write_chunk_blocks = ctx->extract_write_chunk_bytes / ctx->block_size;
+	ctx->extract_cur_block = seg->start_block;
+	atomic_store_explicit(&ctx->extracting, true, memory_order_relaxed);
+
+	admin_buf_appendf(req, "{\"started\":true,\"segment_id\":%u,\"record_count\":%" PRIu64
+			   ",\"output_path\":\"%s\"}", seg->segment_id, seg->record_count,
+			   ctx->extract_output_path);
+
+	/* This request is fully served NOW - the walk below runs detached
+	 * from req/admin_req from here on (see the comment above this op's
+	 * block). */
+	chrono_admin_fulfill(req, 0);
+
+	extract_read_next_chunk(ctx);
+}
+
+static void
+admin_do_segment_extract_start(struct app_context_t *ctx, struct chrono_admin_request *req)
+{
+	int rc;
+
+	if (atomic_load_explicit(&ctx->extracting, memory_order_relaxed)) {
+		fclose(ctx->extract_file);
+		ctx->extract_file = NULL;
+		chrono_admin_fulfill(req, -EBUSY);
+		return;
+	}
+
+	rc = spdk_bdev_read(ctx->bdev_desc, ctx->bdev_io_channel, ctx->io_buf,
+			     (ctx->vol.toc_start_block + req->req_segment_id) * ctx->block_size,
+			     ctx->block_size, admin_extract_entry_read_complete, ctx);
+	if (rc != 0) {
+		fclose(ctx->extract_file);
+		ctx->extract_file = NULL;
+		chrono_admin_fulfill(req, rc);
+	}
+}
+
 void
 chrono_admin_dispatch(void *arg)
 {
@@ -691,6 +903,9 @@ chrono_admin_dispatch(void *arg)
 		break;
 	case CHRONO_ADMIN_SET_LOCAL_IP:
 		admin_do_set_local_ip(ctx, req);
+		break;
+	case CHRONO_ADMIN_SEGMENT_EXTRACT_START:
+		admin_do_segment_extract_start(ctx, req);
 		break;
 	default:
 		chrono_admin_fulfill(req, -EINVAL);
