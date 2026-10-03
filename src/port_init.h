@@ -19,9 +19,19 @@
  * force_10g restricts advertised speed to rule out autonegotiation as a
  * factor on hardware that's physically only capable of one speed anyway.
  *
+ * strip_vlan requests hardware VLAN-tag stripping (RTE_ETH_RX_OFFLOAD_
+ * VLAN_STRIP) when the bound PMD actually advertises it in dev_info.
+ * rx_offload_capa - checked here at runtime rather than assumed from the
+ * vendor, since this project links against more than one NIC driver
+ * (atlantic, enic) with no guarantee both support the same offloads.
+ * *hw_vlan_strip_out is set to whether it was actually enabled; the
+ * caller (main.c's capture_poll()) still needs its own software fallback
+ * for whichever PMD/offload combination comes back false.
+ *
  * Returns 0 on success. Prints only genuine DPDK function errors to
  * stderr - nothing else. */
 int chrono_port_init(uint16_t port, struct rte_mempool *mbuf_pool, uint16_t mtu,
-		      bool force_10g, struct rte_ether_addr *mac_addr_out);
+		      bool force_10g, bool strip_vlan, bool *hw_vlan_strip_out,
+		      struct rte_ether_addr *mac_addr_out);
 
 #endif

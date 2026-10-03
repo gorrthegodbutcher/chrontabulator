@@ -77,6 +77,7 @@ enum {
 	CHRONO_OPT_WRITE_CHUNK_KB,
 	CHRONO_OPT_REPAIR_CHUNK_BYTES,
 	CHRONO_OPT_NO_WIRE_SEQ,
+	CHRONO_OPT_STRIP_VLAN,
 };
 
 static const struct option chrono_long_opts[] = {
@@ -88,6 +89,7 @@ static const struct option chrono_long_opts[] = {
 	{"write-chunk-kb",     required_argument, NULL, CHRONO_OPT_WRITE_CHUNK_KB},
 	{"repair-chunk-bytes", required_argument, NULL, CHRONO_OPT_REPAIR_CHUNK_BYTES},
 	{"no-wire-seq",        no_argument,       NULL, CHRONO_OPT_NO_WIRE_SEQ},
+	{"strip-vlan",         no_argument,       NULL, CHRONO_OPT_STRIP_VLAN},
 	{NULL, 0, NULL, 0},
 };
 
@@ -140,6 +142,11 @@ app_usage(void)
 	printf("                           Live-tunable from the web UI while not recording\n");
 	printf("                           (POST /wire-has-seq?value=0|1) - this flag only sets\n");
 	printf("                           the daemon's startup value.\n");
+	printf(" --strip-vlan              strip a single 802.1Q VLAN tag from each inbound\n");
+	printf("                           frame before parsing it - needed to capture traffic\n");
+	printf("                           arriving on a trunk/tagged link. Untagged frames are\n");
+	printf("                           passed through unchanged. Default: off (expect\n");
+	printf("                           untagged Ethernet frames).\n");
 }
 
 static int
@@ -217,6 +224,9 @@ app_parse_arg(int ch, char *arg)
 	}
 	case CHRONO_OPT_NO_WIRE_SEQ:
 		g_ctx.opts.wire_has_seq = false;
+		break;
+	case CHRONO_OPT_STRIP_VLAN:
+		g_ctx.opts.strip_vlan = true;
 		break;
 	default:
 		return -EINVAL;
@@ -676,6 +686,23 @@ capture_poll(void *arg)
 		uint8_t *data = rte_pktmbuf_mtod(bufs[i], uint8_t *);
 		uint32_t len = rte_pktmbuf_pkt_len(bufs[i]);
 
+		/* --strip-vlan: app_parse_packet() only understands the
+		 * untagged Ethernet+IPv4+UDP layout common.h documents, so a
+		 * single 802.1Q tag (ethertype 0x8100 at [12:14)) has to come
+		 * out first - overwrite the 4-byte tag by shifting the real
+		 * ethertype and everything after it left in place, then shrink
+		 * len to match. A double-tagged (QinQ) frame only loses its
+		 * outer tag; untagged frames are left untouched. Skipped
+		 * entirely when hw_vlan_strip_active - the PMD (atlantic,
+		 * enic, ...) already removed the tag before RX handed us this
+		 * mbuf, so the bytes here are untagged already and touching
+		 * them again would corrupt the frame. */
+		if (ctx->opts.strip_vlan && !ctx->hw_vlan_strip_active &&
+		    len >= 18 && data[12] == 0x81 && data[13] == 0x00) {
+			memmove(data + 12, data + 16, len - 16);
+			len -= 4;
+		}
+
 		uint16_t dst_port;
 		uint64_t seq;
 		const uint8_t *payload;
@@ -893,13 +920,16 @@ claim_header_write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb
 
 	struct rte_ether_addr mac_addr;
 	rc = chrono_port_init(ctx->port, ctx->mbuf_pool, ctx->opts.mtu, ctx->opts.force_10g,
-			       &mac_addr);
+			       ctx->opts.strip_vlan, &ctx->hw_vlan_strip_active, &mac_addr);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to initialize port %u\n", ctx->port);
 		fail_started(ctx);
 		return;
 	}
 	ctx->nic_up = true;
+	if (ctx->opts.strip_vlan)
+		SPDK_NOTICELOG("VLAN stripping: %s\n",
+			       ctx->hw_vlan_strip_active ? "hardware offload" : "software fallback");
 	rte_ether_addr_copy(&mac_addr, &ctx->local_mac);
 
 	SPDK_NOTICELOG("Recording UDP port %u to bdev %s, segment %u, port %u ready\n",
@@ -1989,13 +2019,16 @@ daemon_bring_up_nic(struct app_context_t *ctx)
 
 	struct rte_ether_addr mac_addr;
 	int rc = chrono_port_init(ctx->port, ctx->mbuf_pool, ctx->opts.mtu, ctx->opts.force_10g,
-				   &mac_addr);
+				   ctx->opts.strip_vlan, &ctx->hw_vlan_strip_active, &mac_addr);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to initialize port %u\n", ctx->port);
 		fail_started(ctx);
 		return -1;
 	}
 	ctx->nic_up = true;
+	if (ctx->opts.strip_vlan)
+		SPDK_NOTICELOG("VLAN stripping: %s\n",
+			       ctx->hw_vlan_strip_active ? "hardware offload" : "software fallback");
 	rte_ether_addr_copy(&mac_addr, &ctx->local_mac);
 
 	/* Registered once, here, and left running for the daemon's whole

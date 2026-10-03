@@ -13,13 +13,16 @@
 
 int
 chrono_port_init(uint16_t port, struct rte_mempool *mbuf_pool, uint16_t mtu,
-		  bool force_10g, struct rte_ether_addr *mac_addr_out)
+		  bool force_10g, bool strip_vlan, bool *hw_vlan_strip_out,
+		  struct rte_ether_addr *mac_addr_out)
 {
 	struct rte_eth_conf port_conf;
 	uint16_t nb_rxd = RX_RING_SIZE;
 	uint16_t nb_txd = TX_RING_SIZE;
 	int retval;
 	struct rte_eth_dev_info dev_info;
+
+	*hw_vlan_strip_out = false;
 
 	if (!rte_eth_dev_is_valid_port(port))
 		return -1;
@@ -45,6 +48,18 @@ chrono_port_init(uint16_t port, struct rte_mempool *mbuf_pool, uint16_t mtu,
 		port_conf.rxmode.mtu = mtu;
 		if (mtu > RTE_ETHER_MTU && (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER))
 			port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_SCATTER;
+	}
+
+	/* Query capability rather than assuming it from the vendor - this
+	 * project links against more than one NIC PMD (atlantic, enic) and
+	 * nothing guarantees they agree on which offloads they implement.
+	 * main.c's capture_poll() software-strips the VLAN tag itself
+	 * whenever this comes back false, so a PMD that doesn't support the
+	 * offload still behaves correctly, just a little more expensively
+	 * per packet. */
+	if (strip_vlan && (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_VLAN_STRIP)) {
+		port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_VLAN_STRIP;
+		*hw_vlan_strip_out = true;
 	}
 
 	retval = rte_eth_dev_configure(port, 1, 1, &port_conf);

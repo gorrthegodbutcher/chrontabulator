@@ -70,6 +70,13 @@ struct app_opts_t {
 	 * default) for compatibility with existing test workflows; real
 	 * production traffic (no synthetic prefix) needs --no-wire-seq. */
 	bool wire_has_seq;
+	/* Strip a single 802.1Q VLAN tag (ethertype 0x8100) from each inbound
+	 * frame before handing it to app_parse_packet() - that parser expects
+	 * the untagged Ethernet+IPv4+UDP layout common.h documents, so a
+	 * trunk/tagged link needs this to capture anything at all. Default
+	 * false (matches dpdk-app-example's own untagged-by-default traffic);
+	 * a double-tagged (QinQ) frame only has its outer tag stripped. */
+	bool strip_vlan;
 	uint64_t count_limit; /* 0 = unlimited */
 	bool dump_mode;
 	bool init_mode;
@@ -166,6 +173,14 @@ struct app_context_t {
 		      * catch-all exit points reachable both before and after
 		      * NIC bring-up (dump/list/init modes never bring the NIC
 		      * up at all), so this can't just be "ctx->port != 0". */
+	/* True once chrono_port_init() confirmed the bound PMD actually
+	 * supports RTE_ETH_RX_OFFLOAD_VLAN_STRIP and enabled it (only
+	 * meaningful when ctx->opts.strip_vlan is set) - capture_poll() skips
+	 * its own software VLAN strip when this is true, since the NIC
+	 * already removed the tag before handing the mbuf to RX. Checked
+	 * once at startup per port, not per packet: the capability can't
+	 * change mid-run. */
+	bool hw_vlan_strip_active;
 	struct rte_mempool *mbuf_pool;
 	int mbuf_socket_id; /* rte_socket_id(), captured once on the reactor
 			      * thread (a real EAL thread) when mbuf_pool is
