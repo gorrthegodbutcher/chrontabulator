@@ -16,6 +16,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <time.h>
 
 #include "record.h"
@@ -90,6 +91,13 @@ struct app_opts_t {
 	 * stale relative to what a segment's data was actually written with.
 	 * 0 = not given (a real write_chunk_bytes is never 0). */
 	uint32_t repair_chunk_bytes;
+	/* -D -S <id> --extract=<path> only: instead of printing each record's
+	 * metadata, writes just the UDP payload bytes of every record in the
+	 * segment to this file, back-to-back in stored (seq) order, with no
+	 * header/length/timestamp framing of any kind - exactly the bytes
+	 * that followed the UDP header on the wire, nothing chrontabulator
+	 * itself added. NULL = not requested. */
+	char *extract_path;
 	bool serve_mode;
 	uint16_t web_port; /* 0 = daemon runs headless, no web server */
 
@@ -278,6 +286,11 @@ struct app_context_t {
 	 * a corrupt/overrunning record - see dump_segment_entry_read_complete(). */
 	uint32_t dump_write_chunk_bytes;
 	uint32_t dump_write_chunk_blocks;
+	/* "-S <id> --extract=<path>" only: open output file (NULL whenever
+	 * extract_path isn't set) and running total of payload bytes written
+	 * to it so far, for the final summary line. */
+	FILE *extract_file;
+	uint64_t dump_bytes_extracted;
 
 	/* --serve (daemon) mode only. */
 	_Atomic bool recording;

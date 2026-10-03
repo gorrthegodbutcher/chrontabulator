@@ -28,6 +28,7 @@
 #include <rte_cycles.h>
 #include <rte_mbuf.h>
 
+#include <errno.h>
 #include <getopt.h>
 #include <time.h>
 
@@ -78,6 +79,7 @@ enum {
 	CHRONO_OPT_REPAIR_CHUNK_BYTES,
 	CHRONO_OPT_NO_WIRE_SEQ,
 	CHRONO_OPT_STRIP_VLAN,
+	CHRONO_OPT_EXTRACT,
 };
 
 static const struct option chrono_long_opts[] = {
@@ -90,6 +92,7 @@ static const struct option chrono_long_opts[] = {
 	{"repair-chunk-bytes", required_argument, NULL, CHRONO_OPT_REPAIR_CHUNK_BYTES},
 	{"no-wire-seq",        no_argument,       NULL, CHRONO_OPT_NO_WIRE_SEQ},
 	{"strip-vlan",         no_argument,       NULL, CHRONO_OPT_STRIP_VLAN},
+	{"extract",            required_argument, NULL, CHRONO_OPT_EXTRACT},
 	{NULL, 0, NULL, 0},
 };
 
@@ -147,6 +150,12 @@ app_usage(void)
 	printf("                           arriving on a trunk/tagged link. Untagged frames are\n");
 	printf("                           passed through unchanged. Default: off (expect\n");
 	printf("                           untagged Ethernet frames).\n");
+	printf(" -D -S <id> --extract=<path>\n");
+	printf("                           write segment <id>'s UDP payload bytes to <path>,\n");
+	printf("                           back-to-back in captured order, with no header,\n");
+	printf("                           length, or timestamp framing of any kind added -\n");
+	printf("                           just the bytes that followed the UDP header on the\n");
+	printf("                           wire. Overwrites <path> if it already exists.\n");
 }
 
 static int
@@ -227,6 +236,9 @@ app_parse_arg(int ch, char *arg)
 		break;
 	case CHRONO_OPT_STRIP_VLAN:
 		g_ctx.opts.strip_vlan = true;
+		break;
+	case CHRONO_OPT_EXTRACT:
+		g_ctx.opts.extract_path = arg;
 		break;
 	default:
 		return -EINVAL;
@@ -318,6 +330,8 @@ fail_started(struct app_context_t *ctx)
 		spdk_dma_free(ctx->vol_buf);
 	if (ctx->io_buf)
 		spdk_dma_free(ctx->io_buf);
+	if (ctx->extract_file)
+		fclose(ctx->extract_file);
 	if (ctx->bdev_io_channel)
 		spdk_put_io_channel(ctx->bdev_io_channel);
 	if (ctx->bdev_desc)
@@ -340,6 +354,8 @@ cleanup_and_stop(struct app_context_t *ctx, int rc)
 		spdk_dma_free(ctx->vol_buf);
 	if (ctx->io_buf)
 		spdk_dma_free(ctx->io_buf);
+	if (ctx->extract_file)
+		fclose(ctx->extract_file);
 	if (ctx->bdev_io_channel)
 		spdk_put_io_channel(ctx->bdev_io_channel);
 	if (ctx->bdev_desc)
@@ -1044,11 +1060,26 @@ dump_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_ar
 			return;
 		}
 
-		double rel_sec = ctx->dump_tsc_hz != 0 ?
-			(double)(hdr->capture_tsc - ctx->dump_first_capture_tsc) / ctx->dump_tsc_hz : 0.0;
-		printf("record %" PRIu64 ": seq=%" PRIu64 " capture_tsc=%" PRIu64
-		       " (+%.6fs) len=%u\n",
-		       ctx->dump_records_seen, hdr->seq, hdr->capture_tsc, rel_sec, hdr->len);
+		if (ctx->extract_file) {
+			/* Just the UDP payload, back-to-back, no framing of any
+			 * kind - hdr itself (seq/capture_tsc/len) is this
+			 * capture's own metadata, never written here. */
+			const uint8_t *payload = (const uint8_t *)(hdr + 1);
+			if (hdr->len > 0 && fwrite(payload, 1, hdr->len, ctx->extract_file) != hdr->len) {
+				SPDK_ERRLOG("write error extracting record %" PRIu64 " to %s\n",
+					    ctx->dump_records_seen, ctx->opts.extract_path);
+				cleanup_and_stop(ctx, -1);
+				return;
+			}
+			ctx->dump_bytes_extracted += hdr->len;
+		} else {
+			double rel_sec = ctx->dump_tsc_hz != 0 ?
+				(double)(hdr->capture_tsc - ctx->dump_first_capture_tsc) /
+				ctx->dump_tsc_hz : 0.0;
+			printf("record %" PRIu64 ": seq=%" PRIu64 " capture_tsc=%" PRIu64
+			       " (+%.6fs) len=%u\n",
+			       ctx->dump_records_seen, hdr->seq, hdr->capture_tsc, rel_sec, hdr->len);
+		}
 
 		offset += (uint32_t)sizeof(*hdr) + hdr->len;
 		ctx->dump_records_seen++;
@@ -1057,8 +1088,14 @@ dump_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_ar
 	ctx->dump_cur_block += ctx->dump_write_chunk_blocks;
 
 	if (ctx->dump_records_seen >= ctx->dump_target_count) {
-		printf("Dumped %" PRIu64 " of %" PRIu64 " records from segment %u.\n",
-		       ctx->dump_records_seen, ctx->dump_target_count, ctx->segment_id);
+		if (ctx->extract_file)
+			printf("Extracted %" PRIu64 " records (%" PRIu64 " bytes of UDP payload)"
+			       " from segment %u to %s.\n",
+			       ctx->dump_records_seen, ctx->dump_bytes_extracted, ctx->segment_id,
+			       ctx->opts.extract_path);
+		else
+			printf("Dumped %" PRIu64 " of %" PRIu64 " records from segment %u.\n",
+			       ctx->dump_records_seen, ctx->dump_target_count, ctx->segment_id);
 		cleanup_and_stop(ctx, 0);
 		return;
 	}
@@ -2189,6 +2226,25 @@ app_started(void *arg1)
 		SPDK_ERRLOG("-S requires -D\n");
 		spdk_app_stop(-1);
 		return;
+	}
+	if (ctx->opts.extract_path && !ctx->opts.dump_segment_given) {
+		SPDK_ERRLOG("--extract requires -D -S <id>\n");
+		spdk_app_stop(-1);
+		return;
+	}
+	if (ctx->opts.extract_path && ctx->opts.repair_chunk_bytes != 0) {
+		SPDK_ERRLOG("--extract and --repair-chunk-bytes can't be used together\n");
+		spdk_app_stop(-1);
+		return;
+	}
+	if (ctx->opts.extract_path) {
+		ctx->extract_file = fopen(ctx->opts.extract_path, "wb");
+		if (!ctx->extract_file) {
+			SPDK_ERRLOG("failed to open %s for writing: %s\n",
+				    ctx->opts.extract_path, strerror(errno));
+			spdk_app_stop(-1);
+			return;
+		}
 	}
 
 	SPDK_NOTICELOG("Opening bdev %s\n", ctx->opts.bdev_name);
